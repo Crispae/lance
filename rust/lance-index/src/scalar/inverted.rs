@@ -8,6 +8,8 @@ mod compound;
 mod cross_column;
 mod documents;
 mod encoding;
+#[cfg(test)]
+mod ext_tests;
 mod impact;
 mod index;
 mod iter;

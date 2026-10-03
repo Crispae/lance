@@ -3,6 +3,8 @@
 
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -21,7 +23,7 @@ use lindera::LinderaTokenizerBuilder;
 use crate::pbold;
 use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
-    JsonTokenizer, LanceTokenizer, TextTokenizer,
+    DocType, JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
 use crate::scalar::inverted::{
     InvertedListFormatVersion, default_fts_format_version_for_block_size,
@@ -29,6 +31,7 @@ use crate::scalar::inverted::{
 };
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
+    BoxTokenStream, Token, TokenStream,
     AsciiFoldingFilter, CodeLexTokenizer, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer,
     RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
     WhitespaceTokenizer, WordDelimiterFilter,
@@ -1078,6 +1081,11 @@ impl InvertedIndexParams {
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         self.validate()?;
+        // A registered tokenizer owns the whole analysis chain: none of the filters below
+        // (lower-casing, stemming, stop words, the token length limit) apply to it.
+        if let Some(factory) = registered_tokenizer(&self.base_tokenizer) {
+            return factory(self);
+        }
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
@@ -1105,6 +1113,26 @@ impl InvertedIndexParams {
                 self.lance_tokenizer.as_ref().unwrap()
             ))),
         }
+    }
+
+    /// The tokenizer of an index that already exists, for the paths that open it (search, remap,
+    /// optimize's reads). An index created with an extension tokenizer this process has not
+    /// registered still opens, with a tokenizer that yields no tokens, so a process that only
+    /// reads or maintains postings does not need the extension. Paths that tokenize *documents*
+    /// (creating or updating an index) use [`Self::build`], which fails for an unregistered name
+    /// instead of silently indexing nothing.
+    pub fn build_for_load(&self) -> Result<Box<dyn LanceTokenizer>> {
+        if registered_tokenizer(&self.base_tokenizer).is_none()
+            && is_extension_tokenizer_name(&self.base_tokenizer)
+        {
+            log::warn!(
+                "FTS index uses the extension tokenizer '{}', which is not registered in this \
+                 process; text queries on it return nothing and updates will fail",
+                self.base_tokenizer
+            );
+            return Ok(Box::new(UnregisteredTokenizer));
+        }
+        self.build()
     }
 
     fn stop_word_filter(&self) -> Result<StopWordFilter> {
@@ -1195,6 +1223,104 @@ impl InvertedIndexParams {
     }
 }
 
+/// Builds the tokenizer of a registered `base_tokenizer` name from the index's parameters.
+pub type TokenizerFactory =
+    Arc<dyn Fn(&InvertedIndexParams) -> Result<Box<dyn LanceTokenizer>> + Send + Sync>;
+
+static TOKENIZER_REGISTRY: LazyLock<RwLock<HashMap<String, TokenizerFactory>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Name families that Lance itself resolves (`lindera/<model>`, `jieba/<model>`, `icu/split`).
+const BUILTIN_NAMESPACES: [&str; 3] = ["lindera", "jieba", "icu"];
+
+/// Whether `name` is shaped like an extension tokenizer: `<namespace>/<name>` with a namespace
+/// Lance does not own.
+fn is_extension_tokenizer_name(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(namespace, rest)| {
+        !namespace.is_empty() && !rest.is_empty() && !BUILTIN_NAMESPACES.contains(&namespace)
+    })
+}
+
+fn registered_tokenizer(name: &str) -> Option<TokenizerFactory> {
+    TOKENIZER_REGISTRY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(name)
+        .cloned()
+}
+
+/// Registers a tokenizer under `name`, usable as `InvertedIndexParams::base_tokenizer`
+/// (process-wide). The name is stored in the index and must be registered again, with the same
+/// behaviour, by every process that creates, updates or optimizes the index.
+///
+/// `name` must have the form `<namespace>/<name>` with a namespace other than `lindera`, `jieba`
+/// or `icu`. Registering a name again replaces the earlier factory.
+///
+/// The tokenizer must emit tokens in non-decreasing `position` order; several tokens may share a
+/// position, and positions may skip. The index records exactly the positions it is given.
+pub fn register_tokenizer(name: impl Into<String>, factory: TokenizerFactory) -> Result<()> {
+    let name = name.into();
+    if !is_extension_tokenizer_name(&name) {
+        return Err(Error::invalid_input(format!(
+            "extension tokenizer name '{name}' must be '<namespace>/<name>' with a namespace \
+             other than lindera, jieba or icu"
+        )));
+    }
+    TOKENIZER_REGISTRY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name, factory);
+    Ok(())
+}
+
+/// Removes a registered tokenizer; returns whether it was registered.
+pub fn unregister_tokenizer(name: &str) -> bool {
+    TOKENIZER_REGISTRY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(name)
+        .is_some()
+}
+
+/// Stands in for an extension tokenizer that is not registered in this process; see
+/// [`InvertedIndexParams::build_for_load`].
+#[derive(Debug, Clone)]
+struct UnregisteredTokenizer;
+
+impl LanceTokenizer for UnregisteredTokenizer {
+    fn token_stream_for_search<'a>(&'a mut self, _query_text: &'a str) -> BoxTokenStream<'a> {
+        BoxTokenStream::new(NoTokens)
+    }
+
+    fn token_stream_for_doc<'a>(&'a mut self, _text: &'a str) -> BoxTokenStream<'a> {
+        BoxTokenStream::new(NoTokens)
+    }
+
+    fn box_clone(&self) -> Box<dyn LanceTokenizer> {
+        Box::new(self.clone())
+    }
+
+    fn doc_type(&self) -> DocType {
+        DocType::Text
+    }
+}
+
+struct NoTokens;
+
+impl TokenStream for NoTokens {
+    fn advance(&mut self) -> bool {
+        false
+    }
+
+    fn token(&self) -> &Token {
+        unreachable!("advance() never returned true")
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        unreachable!("advance() never returned true")
+    }
+}
+
 pub const LANCE_LANGUAGE_MODEL_HOME_ENV_KEY: &str = "LANCE_LANGUAGE_MODEL_HOME";
 
 pub const LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY: &str = "lance/language_models";
@@ -1211,11 +1337,155 @@ mod tests {
     use crate::pbold;
     use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 
-    use super::{DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion};
+    use super::{
+        DocType, DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion, LanceTokenizer,
+        TokenizerFactory, register_tokenizer, unregister_tokenizer,
+    };
     use lance_core::Error;
+    use std::sync::Arc;
     use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
     use serde_json::json;
+
+    /// Emits one token per whitespace-separated slot term; the terms of a slot, joined by `,`,
+    /// share the slot's index as their position. A slot of `_` emits nothing but still advances.
+    #[derive(Debug, Clone)]
+    struct SlotTokenizer;
+
+    struct SlotStream {
+        tokens: Vec<lance_tokenizer::Token>,
+        next: usize,
+    }
+
+    impl TokenStream for SlotStream {
+        fn advance(&mut self) -> bool {
+            self.next += 1;
+            self.next <= self.tokens.len()
+        }
+
+        fn token(&self) -> &lance_tokenizer::Token {
+            &self.tokens[self.next - 1]
+        }
+
+        fn token_mut(&mut self) -> &mut lance_tokenizer::Token {
+            &mut self.tokens[self.next - 1]
+        }
+    }
+
+    impl SlotTokenizer {
+        fn stream<'a>(text: &str) -> lance_tokenizer::BoxTokenStream<'a> {
+            let mut tokens = Vec::new();
+            for (position, slot) in text.split_whitespace().enumerate() {
+                if slot == "_" {
+                    continue;
+                }
+                for term in slot.split(',') {
+                    tokens.push(lance_tokenizer::Token {
+                        offset_from: 0,
+                        offset_to: term.len(),
+                        position,
+                        text: term.to_string(),
+                        position_length: 1,
+                    });
+                }
+            }
+            lance_tokenizer::BoxTokenStream::new(SlotStream { tokens, next: 0 })
+        }
+    }
+
+    impl LanceTokenizer for SlotTokenizer {
+        fn token_stream_for_search<'a>(
+            &'a mut self,
+            query_text: &'a str,
+        ) -> lance_tokenizer::BoxTokenStream<'a> {
+            Self::stream(query_text)
+        }
+
+        fn token_stream_for_doc<'a>(
+            &'a mut self,
+            text: &'a str,
+        ) -> lance_tokenizer::BoxTokenStream<'a> {
+            Self::stream(text)
+        }
+
+        fn box_clone(&self) -> Box<dyn LanceTokenizer> {
+            Box::new(self.clone())
+        }
+
+        fn doc_type(&self) -> DocType {
+            DocType::Text
+        }
+    }
+
+    fn collect(tokenizer: &mut Box<dyn LanceTokenizer>, text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        while stream.advance() {
+            out.push((stream.token().position, stream.token().text.clone()));
+        }
+        out
+    }
+
+    fn slot_factory() -> TokenizerFactory {
+        Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>))
+    }
+
+    #[test]
+    fn test_registered_tokenizer_owns_the_whole_analysis_chain() {
+        let name = "rustie-test/slots-chain";
+        register_tokenizer(name, slot_factory()).unwrap();
+        // The default params lower-case, stem, drop stop words and long tokens; none of that may
+        // touch a registered tokenizer's output.
+        let params = InvertedIndexParams::new(name.to_string(), Language::English);
+        assert!(params.lower_case && params.stem && params.remove_stop_words);
+        let long = "L".repeat(80);
+        let mut tokenizer = params.build().unwrap();
+        let tokens = collect(&mut tokenizer, &format!("The,CATS _ {long} running,runs"));
+        assert_eq!(
+            tokens,
+            vec![
+                (0, "The".to_string()),
+                (0, "CATS".to_string()),
+                (2, long),
+                (3, "running".to_string()),
+                (3, "runs".to_string()),
+            ],
+            "several terms share a position, a skipped slot leaves a gap, nothing is filtered"
+        );
+        assert!(unregister_tokenizer(name));
+        assert!(!unregister_tokenizer(name));
+    }
+
+    #[test]
+    fn test_extension_tokenizer_names_are_validated() {
+        for bad in ["slots", "/slots", "ns/", "lindera/ipadic", "jieba/x", "icu/split"] {
+            assert!(
+                register_tokenizer(bad, slot_factory()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+        assert!(register_tokenizer("rustie-test/ok-name", slot_factory()).is_ok());
+        assert!(unregister_tokenizer("rustie-test/ok-name"));
+    }
+
+    #[test]
+    fn test_unregistered_extension_tokenizer_opens_for_reading_but_not_for_writing() {
+        let params = InvertedIndexParams::new("rustie-test/not-registered".to_string(), Language::English);
+        assert!(
+            params.build().is_err(),
+            "creating or updating an index must not silently index nothing"
+        );
+        let mut tokenizer = params.build_for_load().unwrap();
+        assert!(collect(&mut tokenizer, "any text at all").is_empty());
+        let mut stream = tokenizer.token_stream_for_search("query");
+        assert!(!stream.advance());
+
+        // An unknown name outside the extension shape keeps Lance's own error on load.
+        let typo = InvertedIndexParams::new("simpel".to_string(), Language::English);
+        assert!(typo.build_for_load().is_err());
+        let lindera = InvertedIndexParams::new("lindera/not-installed".to_string(), Language::English);
+        assert!(lindera.build_for_load().is_err());
+    }
 
     #[test]
     fn test_physical_params_omit_creation_only_fields() {

@@ -522,7 +522,7 @@ impl InvertedIndex {
                     DocumentGranularity::ListElement
                 };
 
-                let tokenizer = params.build()?;
+                let tokenizer = params.build_for_load()?;
                 Ok(Arc::new(Self {
                     params,
                     store,
@@ -634,7 +634,7 @@ impl InvertedIndex {
                     DocumentGranularity::ListElement
                 };
 
-                let tokenizer = params.build()?;
+                let tokenizer = params.build_for_load()?;
                 Ok(Arc::new(Self {
                     params,
                     store,

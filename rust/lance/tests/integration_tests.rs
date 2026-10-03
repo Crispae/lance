@@ -5,6 +5,7 @@
 
 mod count_pushdown;
 mod mem_wal;
+mod rustie_ext;
 #[cfg(feature = "slow_tests")]
 mod query;
 #[cfg(feature = "slow_tests")]
