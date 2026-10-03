@@ -99,6 +99,7 @@ use crate::{
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
+mod bulk;
 mod cache;
 mod cursor;
 mod doc_set;
@@ -117,6 +118,7 @@ mod search;
 mod search_candidates;
 mod token_set;
 
+pub use bulk::*;
 pub use cache::*;
 pub use cursor::*;
 pub use doc_set::*;

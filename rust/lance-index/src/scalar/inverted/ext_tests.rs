@@ -117,6 +117,16 @@ fn document(i: usize) -> (String, Vec<(String, u32)>) {
         slots.push("common".to_string());
     }
     terms.push(("common".to_string(), 3));
+    // Position 4: many rare terms (a few documents each), so the dictionary has hundreds of tokens
+    // with short, scattered postings; every fifth document has a second one at the same position.
+    if i.is_multiple_of(5) {
+        slots.push(format!("z{},y{}", i % 300, i % 40));
+        terms.push((format!("z{}", i % 300), 4));
+        terms.push((format!("y{}", i % 40), 4));
+    } else {
+        slots.push(format!("z{}", i % 300));
+        terms.push((format!("z{}", i % 300), 4));
+    }
     (slots.join(" "), terms)
 }
 
@@ -135,6 +145,10 @@ fn batch(range: std::ops::Range<usize>) -> RecordBatch {
 }
 
 async fn build_index(name: &str, num_docs: usize, with_position: bool) -> Arc<InvertedIndex> {
+    build_index_with_cache(name, num_docs, with_position, LanceCache::no_cache()).await
+}
+
+async fn build_index_with_cache(name: &str, num_docs: usize, with_position: bool, cache: LanceCache) -> Arc<InvertedIndex> {
     register_tokenizer(name, Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>))).unwrap();
     let dir = TempDir::default();
     let store = Arc::new(LanceIndexStore::new(
@@ -152,7 +166,7 @@ async fn build_index(name: &str, num_docs: usize, with_position: bool) -> Arc<In
         .unwrap();
     // The directory must outlive the index: it is dropped with the test's store.
     std::mem::forget(dir);
-    InvertedIndex::load(store, None, &LanceCache::no_cache()).await.unwrap()
+    InvertedIndex::load(store, None, &cache).await.unwrap()
 }
 
 /// `term -> [(doc index, positions)]`, from the generator.
@@ -310,4 +324,81 @@ async fn test_an_index_opens_without_its_tokenizer_but_cannot_be_extended() {
     assert_eq!(drain(&mut cursor, true).len(), 50);
     // Tokenizing documents (create / update) fails loudly rather than indexing nothing.
     assert!(params.build().is_err());
+}
+
+/// Every term of the partition's dictionary, as token ids.
+fn all_token_ids(partition: &crate::scalar::inverted::InvertedPartition) -> Vec<u32> {
+    let fst = partition.token_fst().expect("a loaded partition has an FST dictionary");
+    let mut ids = Vec::new();
+    let mut s = fst::IntoStreamer::into_stream(fst);
+    while let Some((_, id)) = fst::Streamer::next(&mut s) {
+        ids.push(id as u32);
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// The bulk path must give exactly the per-token path's postings and positions, for every token,
+/// for scattered, repeated and unordered requests, with and without a cache (the second call is
+/// served from it), and `doc_freq` must not change once the metadata is resident.
+#[tokio::test]
+async fn test_bulk_cursors_equal_per_token_cursors() {
+    const NUM_DOCS: usize = 1_000;
+    let metrics = NoOpMetricsCollector;
+    for (label, cache) in [("uncached", LanceCache::no_cache()), ("cached", LanceCache::with_capacity(64 << 20))] {
+        let name = format!("rustie-test/slots-bulk-{label}");
+        let index = build_index_with_cache(&name, NUM_DOCS, true, cache).await;
+        for partition in index.partitions() {
+            let ids = all_token_ids(partition);
+            assert!(ids.len() > 50, "enough tokens to scatter requests ({})", ids.len());
+
+            // Sorted, shuffled with repeats, a sparse subset, and a single token.
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut shuffled: Vec<u32> = ids.iter().copied().chain(ids.iter().copied().take(20)).collect();
+            for i in (1..shuffled.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                shuffled.swap(i, (state >> 33) as usize % (i + 1));
+            }
+            let sparse: Vec<u32> = ids.iter().copied().step_by(7).collect();
+            let requests = [ids.clone(), shuffled, sparse, vec![ids[ids.len() / 2]]];
+
+            for with_positions in [true, false] {
+                for request in &requests {
+                    for pass in 0..2 {
+                        let mut bulk = partition.posting_cursors(request, with_positions, &metrics).await.unwrap();
+                        assert_eq!(bulk.len(), request.len());
+                        for (cursor, &token) in bulk.iter_mut().zip(request) {
+                            let mut single = partition.posting_cursor(token, with_positions, &metrics).await.unwrap();
+                            assert_eq!(cursor.len(), single.len(), "length of token {token}");
+                            assert_eq!(
+                                drain(cursor, with_positions),
+                                drain(&mut single, with_positions),
+                                "token {token} ({label}, positions {with_positions}, pass {pass})"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Document frequencies are the same before and after the bulk metadata load.
+            let before: Vec<u32> = futures::future::join_all(ids.iter().map(|&t| partition.doc_freq(t, None))).await.into_iter().map(Result::unwrap).collect();
+            partition.load_term_metadata().await.unwrap();
+            let after: Vec<u32> = futures::future::join_all(ids.iter().map(|&t| partition.doc_freq(t, None))).await.into_iter().map(Result::unwrap).collect();
+            assert_eq!(before, after);
+        }
+        assert!(unregister_tokenizer(&name));
+    }
+}
+
+#[tokio::test]
+async fn test_bulk_positions_require_an_index_built_with_positions() {
+    let name = "rustie-test/slots-bulk-nopos";
+    let index = build_index(name, 200, false).await;
+    let partition = &index.partitions()[0];
+    let ids = all_token_ids(partition);
+    assert!(partition.posting_cursors(&ids, true, &NoOpMetricsCollector).await.is_err());
+    let mut cursors = partition.posting_cursors(&ids, false, &NoOpMetricsCollector).await.unwrap();
+    let total: usize = cursors.iter_mut().map(|cursor| drain(cursor, false).len()).sum();
+    assert!(total >= 200);
+    assert!(unregister_tokenizer(name));
 }

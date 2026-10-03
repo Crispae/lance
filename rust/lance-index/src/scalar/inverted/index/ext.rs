@@ -77,6 +77,38 @@ impl InvertedPartition {
         }
     }
 
+    /// Loads the per-token document counts (and scores) of the whole partition in two requests, so
+    /// [`Self::doc_freq`] is answered from memory afterwards. Worth it once a query looks up more than
+    /// a few dozen tokens (a regex expansion): it costs about 8 bytes per dictionary token, once,
+    /// instead of two requests per token. Not for point queries.
+    pub async fn load_term_metadata(&self) -> Result<()> {
+        self.inverted_list.ensure_metadata_loaded().await
+    }
+
+    /// Cursors over many tokens' documents, in the order of `token_ids` (repeats allowed), read in a
+    /// few coalesced requests instead of several per token, and cached per token.
+    ///
+    /// Use it when a query opens many cursors at once (thousands of terms of a regex): requests grow
+    /// with the spread of the tokens in the dictionary, not with their number. It loads the
+    /// partition's per-token metadata (see [`Self::load_term_metadata`]); for a handful of tokens
+    /// [`Self::posting_cursor`] is cheaper. Rows between wanted ones may be read and discarded, so it
+    /// reads somewhat more bytes than the per-token path. Partitions in the legacy layout are rejected.
+    pub async fn posting_cursors(
+        &self,
+        token_ids: &[u32],
+        with_positions: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<PostingCursor>> {
+        let mut lists = self.inverted_list.bulk_term_lists(token_ids, metrics).await?;
+        if with_positions {
+            let positions = self.inverted_list.bulk_positions(token_ids, metrics).await?;
+            for (list, positions) in lists.iter_mut().zip(positions) {
+                list.positions = Some(positions);
+            }
+        }
+        lists.into_iter().map(|list| PostingCursor::new(list, with_positions)).collect()
+    }
+
     /// The partition's doc id → row id table. The first call loads the whole table; keep the
     /// result for the lifetime of the query (or longer).
     pub async fn rows(&self) -> Result<PartitionRows> {
