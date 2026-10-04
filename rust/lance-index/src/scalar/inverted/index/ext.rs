@@ -121,6 +121,9 @@ impl InvertedPartition {
     /// The partition's doc id → row id table. The first call loads the whole table; keep the
     /// result for the lifetime of the query (or longer).
     pub async fn rows(&self) -> Result<PartitionRows> {
+        // The combined load reads the two columns in one request batch; `address_keyed` alone
+        // reads them one after the other, each with its own page initialization.
+        self.docs.load_columns().await?;
         Ok(PartitionRows(self.docs.address_keyed().await?))
     }
 }

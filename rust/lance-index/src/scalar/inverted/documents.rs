@@ -1237,6 +1237,14 @@ impl PartitionDocumentStore {
         }
     }
 
+    /// Loads the row id and token count columns together, without the scoring norms.
+    pub(crate) async fn load_columns(&self) -> Result<()> {
+        match self {
+            Self::Legacy(_) => Ok(()),
+            Self::Modern(docs) => docs.load_columns().await,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn query_ready(&self) -> bool {
         match self {
@@ -2130,61 +2138,68 @@ impl PartitionDocuments {
         }
     }
 
+    /// Loads the row id and token count columns in one request batch when neither is loaded yet,
+    /// and publishes the lengths and the address projection. [`Self::prewarm`] starts with this;
+    /// callers that need only the two columns (not the scoring norms) call it alone.
+    pub(crate) async fn load_columns(&self) -> Result<()> {
+        if self.lengths.get().is_none() && self.projection.get().is_none() {
+            let reader = self.reader().await?;
+            let batch = reader
+                .read_range(0..self.num_docs, Some(&[ROW_ID, NUM_TOKEN_COL]))
+                .await?;
+            let lengths = self.lengths_from_batch(&batch)?;
+            let row_ids =
+                Arc::new(required_u64_column(&batch, ROW_ID, &self.path)?.clone());
+            if row_ids.null_count() != 0 {
+                return Err(corrupt_docs(
+                    &self.path,
+                    format!("{ROW_ID} contains null values"),
+                ));
+            }
+            let projection = if let Some(remapping) = &self.batch_remapper {
+                // Tagged asynchronous path.
+                VersionAddressProjection::try_new_with_remapping(
+                    row_ids.as_ref(),
+                    self.num_docs,
+                    remapping.as_ref(),
+                    &self.path,
+                )
+                .await?
+            } else {
+                // Legacy synchronous remapping path.
+                Arc::new(VersionAddressProjection::try_new(
+                    row_ids.as_ref(),
+                    self.num_docs,
+                    self.remapper.as_deref(),
+                    &self.path,
+                )?)
+            };
+            let cached_row_ids = Arc::new(CachedDocRowIds {
+                row_ids: row_ids.clone(),
+            });
+            self.index_cache
+                .insert_with_key(
+                    &DocRowIdsKey {
+                        partition_id: self.partition_id,
+                    },
+                    cached_row_ids,
+                )
+                .await;
+            self.shared_addresses.store(Arc::downgrade(&row_ids));
+
+            // A concurrent single-column request may win either OnceCell.
+            // Awaiting the accessors below joins that initialization without
+            // replacing the already-published value.
+            let _ = self.lengths.set(lengths);
+            let _ = self.projection.set(projection);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prewarm(&self) -> Result<()> {
         self.prewarm_complete
             .get_or_try_init(|| async {
-                if self.lengths.get().is_none() && self.projection.get().is_none() {
-                    let reader = self.reader().await?;
-                    let batch = reader
-                        .read_range(0..self.num_docs, Some(&[ROW_ID, NUM_TOKEN_COL]))
-                        .await?;
-                    let lengths = self.lengths_from_batch(&batch)?;
-                    let row_ids =
-                        Arc::new(required_u64_column(&batch, ROW_ID, &self.path)?.clone());
-                    if row_ids.null_count() != 0 {
-                        return Err(corrupt_docs(
-                            &self.path,
-                            format!("{ROW_ID} contains null values"),
-                        ));
-                    }
-                    let projection = if let Some(remapping) = &self.batch_remapper {
-                        // Tagged asynchronous path.
-                        VersionAddressProjection::try_new_with_remapping(
-                            row_ids.as_ref(),
-                            self.num_docs,
-                            remapping.as_ref(),
-                            &self.path,
-                        )
-                        .await?
-                    } else {
-                        // Legacy synchronous remapping path.
-                        Arc::new(VersionAddressProjection::try_new(
-                            row_ids.as_ref(),
-                            self.num_docs,
-                            self.remapper.as_deref(),
-                            &self.path,
-                        )?)
-                    };
-                    let cached_row_ids = Arc::new(CachedDocRowIds {
-                        row_ids: row_ids.clone(),
-                    });
-                    self.index_cache
-                        .insert_with_key(
-                            &DocRowIdsKey {
-                                partition_id: self.partition_id,
-                            },
-                            cached_row_ids,
-                        )
-                        .await;
-                    self.shared_addresses.store(Arc::downgrade(&row_ids));
-
-                    // A concurrent single-column request may win either OnceCell.
-                    // Awaiting the accessors below joins that initialization without
-                    // replacing the already-published value.
-                    let _ = self.lengths.set(lengths);
-                    let _ = self.projection.set(projection);
-                }
-
+                self.load_columns().await?;
                 let lengths = self.lengths().await?;
                 spawn_cpu(move || {
                     let _ = lengths.scoring_norms();

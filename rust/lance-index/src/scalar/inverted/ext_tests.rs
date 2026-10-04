@@ -502,3 +502,48 @@ async fn test_concurrent_cold_readers_share_page_initialization() {
     assert!(concurrent <= sequential, "concurrent cold readers read {concurrent} times, one after another {sequential}");
     assert!(unregister_tokenizer(name));
 }
+
+/// `rows()` loads the document row ids and lengths in one request batch, so opening a cold
+/// partition costs fewer reads than loading the two columns one after the other (what
+/// `address_keyed` alone does), and returns the same table. The files are small, as for a segment of
+/// a few thousand sentences: below the store's block size each read fetches the whole object, so
+/// every extra read is a full download.
+#[tokio::test]
+async fn test_rows_load_the_document_columns_together() {
+    let name = "rustie-test/slots-rows-open";
+    register_tokenizer(name, Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>))).unwrap();
+    // A block size above the file sizes makes every read fetch the whole object, as on S3 for a small
+    // segment (the default there is 64 KiB).
+    let temp = TempDir::default();
+    let params = lance_io::object_store::ObjectStoreParams { block_size: Some(1 << 20), ..Default::default() };
+    let (object_store, dir) = ObjectStore::from_uri_and_params(Default::default(), &format!("file://{}", temp.path_str()), &params).await.unwrap();
+    let build = LanceIndexStore::with_format_version(object_store.clone(), dir.clone(), Arc::new(LanceCache::no_cache()), ConcreteFileVersion::V2_2);
+    let params = InvertedIndexParams::new(name.to_string(), Language::English).with_position(true);
+    let batches: Vec<_> = (0..2_000).step_by(400).map(|s| Ok(batch(s..(s + 400).min(2_000)))).collect();
+    let schema = batch(0..1).schema();
+    let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches));
+    InvertedIndexBuilder::new(params).update(Box::pin(stream), &build, None).await.unwrap();
+    let open = || {
+        let (object_store, dir) = (object_store.clone(), dir.clone());
+        async move {
+            let store = Arc::new(LanceIndexStore::with_format_version(object_store.clone(), dir, Arc::new(LanceCache::with_capacity(64 << 20)), ConcreteFileVersion::V2_2));
+            let cache = LanceCache::with_capacity(64 << 20);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            object_store.io_stats_incremental();
+            (index, cache)
+        }
+    };
+    let (index, _cache) = open().await;
+    let rows = index.partitions()[0].rows().await.unwrap();
+    let together = object_store.io_stats_incremental().read_iops;
+    let (index, _cache) = open().await;
+    let separate_rows = index.partitions()[0].docs.address_keyed().await.unwrap();
+    let separate = object_store.io_stats_incremental().read_iops;
+    assert!(together < separate, "together {together} reads, separately {separate}");
+    assert_eq!(rows.len(), 2_000);
+    assert_eq!(separate_rows.len(), 2_000);
+    for doc in [0u32, 1, 999, 1_999] {
+        assert_eq!(rows.row_id(doc), index.partitions()[0].rows().await.unwrap().row_id(doc));
+    }
+    assert!(unregister_tokenizer(name));
+}
