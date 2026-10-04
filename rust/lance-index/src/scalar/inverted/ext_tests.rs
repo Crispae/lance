@@ -15,6 +15,7 @@ use futures::stream;
 use lance_core::ROW_ID;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempDir;
+use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_tokenizer::{BoxTokenStream, Token, TokenStream};
 
@@ -413,9 +414,14 @@ async fn test_bulk_positions_require_an_index_built_with_positions() {
 /// Builds an index on disk and keeps its directory, so it can be loaded again (with its own object
 /// store and cache) to count reads.
 async fn build_files(name: &str, num_docs: usize) -> TempDir {
+    build_files_in(name, num_docs, ConcreteFileVersion::V2_0).await
+}
+
+/// [`build_files`] writing the index files in file format `version`.
+async fn build_files_in(name: &str, num_docs: usize, version: ConcreteFileVersion) -> TempDir {
     register_tokenizer(name, Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>))).unwrap();
     let dir = TempDir::default();
-    let store = Arc::new(LanceIndexStore::new(Arc::new(ObjectStore::local()), dir.obj_path(), Arc::new(LanceCache::no_cache())));
+    let store = Arc::new(LanceIndexStore::with_format_version(Arc::new(ObjectStore::local()), dir.obj_path(), Arc::new(LanceCache::no_cache()), version));
     let params = InvertedIndexParams::new(name.to_string(), Language::English).with_position(true);
     let batches: Vec<_> = (0..num_docs).step_by(400).map(|s| Ok(batch(s..(s + 400).min(num_docs)))).collect();
     let schema = batch(0..1).schema();
@@ -453,5 +459,46 @@ async fn test_concurrent_bulk_reads_share_one_read_per_token() {
     let eight = reads(8).await;
     assert!(one > 0, "the bulk read touched the object store");
     assert_eq!(eight, one, "eight concurrent calls must not re-read what one call reads");
+    assert!(unregister_tokenizer(name));
+}
+
+/// Concurrent readers of different tokens still share one initialization of each cold page: the
+/// cache alone does not share it, so before the fix every reader read the page metadata again.
+/// Eight concurrent callers, each with its own token, must read no more than the same callers one
+/// after another. Page initialization exists only in the structural formats (2.1+), as on S3.
+#[tokio::test]
+async fn test_concurrent_cold_readers_share_page_initialization() {
+    let name = "rustie-test/slots-page-init";
+    let dir = build_files_in(name, 60_000, ConcreteFileVersion::V2_2).await;
+    let reads = |concurrent: bool| {
+        let dir = &dir;
+        async move {
+            let object_store = Arc::new(ObjectStore::local());
+            // Page metadata is cached in the store's (file) cache, as in a dataset session.
+            let store = Arc::new(LanceIndexStore::new(object_store.clone(), dir.obj_path(), Arc::new(LanceCache::with_capacity(64 << 20))));
+            let cache = LanceCache::with_capacity(64 << 20);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            let partition = &index.partitions()[0];
+            let ids = all_token_ids(partition);
+            // Eight tokens spread over the dictionary, one per caller.
+            let picks: Vec<u32> = (0..8).map(|i| ids[i * (ids.len() - 1) / 7]).collect();
+            object_store.io_stats_incremental();
+            if concurrent {
+                let calls = picks.iter().map(|id| partition.posting_cursors(std::slice::from_ref(id), true, &NoOpMetricsCollector));
+                for result in futures::future::join_all(calls).await {
+                    assert_eq!(result.unwrap().len(), 1);
+                }
+            } else {
+                for id in &picks {
+                    assert_eq!(partition.posting_cursors(std::slice::from_ref(id), true, &NoOpMetricsCollector).await.unwrap().len(), 1);
+                }
+            }
+            object_store.io_stats_incremental().read_iops
+        }
+    };
+    let sequential = reads(false).await;
+    let concurrent = reads(true).await;
+    assert!(sequential > 0, "the reads touched the object store");
+    assert!(concurrent <= sequential, "concurrent cold readers read {concurrent} times, one after another {sequential}");
     assert!(unregister_tokenizer(name));
 }

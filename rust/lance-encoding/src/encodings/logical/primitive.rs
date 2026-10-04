@@ -8,7 +8,7 @@ use std::{
     fmt::Debug,
     iter,
     ops::Range,
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
     vec,
 };
 
@@ -35,7 +35,9 @@ use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache},
+    cache::{
+        CacheKey, CacheKeySchema, Context, DeepSizeOf, InternalCacheKey, KeyBuilder, LanceCache,
+    },
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
@@ -4930,6 +4932,67 @@ async fn read_page_initialization_buffers(
         .collect()
 }
 
+/// Page initializations in progress, by cache entry. The cache cannot share them: readers that
+/// miss at the same time each read the page's metadata again, which on object storage is the same
+/// request repeated once per concurrent reader.
+static PAGE_INITS_IN_FLIGHT: LazyLock<
+    Mutex<HashMap<InternalCacheKey, tokio::sync::watch::Receiver<bool>>>,
+> = LazyLock::new(Default::default);
+
+/// The page entries one call is initializing; released, and waiters woken, when dropped (also on
+/// failure or cancellation).
+struct PageInitClaim {
+    keys: Vec<InternalCacheKey>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for PageInitClaim {
+    fn drop(&mut self) {
+        let mut in_flight = PAGE_INITS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            in_flight.remove(key);
+        }
+        drop(in_flight);
+        self.done.send_replace(true);
+    }
+}
+
+/// Claims each entry of `keys` that nobody is initializing. Returns the claim (if any entry was
+/// free), for each key whether this call owns it, and what to wait on for the others.
+fn claim_page_inits(
+    keys: &[InternalCacheKey],
+) -> (
+    Option<PageInitClaim>,
+    Vec<bool>,
+    Vec<tokio::sync::watch::Receiver<bool>>,
+) {
+    let (done, receiver) = tokio::sync::watch::channel(false);
+    let mut in_flight = PAGE_INITS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut owned = Vec::with_capacity(keys.len());
+    let mut mine = Vec::new();
+    let mut waits = Vec::new();
+    for key in keys {
+        match in_flight.get(key) {
+            Some(other) => {
+                waits.push(other.clone());
+                owned.push(false);
+            }
+            None => {
+                in_flight.insert(*key, receiver.clone());
+                mine.push(*key);
+                owned.push(true);
+            }
+        }
+    }
+    drop(in_flight);
+    let claim = (!mine.is_empty()).then_some(PageInitClaim { keys: mine, done });
+    (claim, owned, waits)
+}
+
 async fn cache_initialized_page(
     cache: Arc<LanceCache>,
     cache_key: PageDataCacheKey,
@@ -5097,11 +5160,61 @@ impl StructuralPrimitiveFieldScheduler {
             return Ok(());
         }
 
+        // Pages another reader is already initializing are waited for, not read again. This
+        // call's own claim is released before waiting, so two readers can never wait on each other.
+        let keys: Vec<_> = misses
+            .iter()
+            .map(|miss| cache.entry_key(&miss.cache_key))
+            .collect();
+        let (claim, owned, waits) = claim_page_inits(&keys);
+        if waits.is_empty() {
+            let result = self.read_and_initialize(misses, &cache, context).await;
+            drop(claim);
+            return result;
+        }
+        let (own, others): (Vec<_>, Vec<_>) = misses
+            .into_iter()
+            .zip(owned)
+            .partition_map(|(miss, owned)| {
+                if owned {
+                    itertools::Either::Left(miss)
+                } else {
+                    itertools::Either::Right(miss.page_idx)
+                }
+            });
+        let result = if own.is_empty() {
+            Ok(())
+        } else {
+            self.read_and_initialize(own, &cache, context).await
+        };
+        drop(claim);
+        result?;
+        for mut wait in waits {
+            // An error means the owner is gone, which is also a release.
+            let _ = wait.wait_for(|done| *done).await;
+        }
+        // The owners have cached their pages (or failed): load them, and read any still missing.
+        let misses = self
+            .find_cache_misses(others.into_iter(), &cache)
+            .await?;
+        if misses.is_empty() {
+            return Ok(());
+        }
+        self.read_and_initialize(misses, &cache, context).await
+    }
+
+    /// Reads the metadata of `misses` in one request batch and initializes their pages.
+    async fn read_and_initialize(
+        &mut self,
+        misses: Vec<PageCacheMiss>,
+        cache: &Arc<LanceCache>,
+        context: &SchedulerContext,
+    ) -> Result<()> {
         // Concatenate the misses' metadata ranges into one request so adjacent
         // ranges coalesce into shared GETs instead of one request per page.
         let all_ranges = Self::initialization_ranges(&misses);
         let buffers = read_page_initialization_buffers(context.io(), all_ranges).await?;
-        self.initialize_cache_misses(misses, buffers, cache, context.io())
+        self.initialize_cache_misses(misses, buffers, cache.clone(), context.io())
             .await
     }
 }

@@ -550,6 +550,12 @@ impl LanceCache {
         }
     }
 
+    /// The key `cache_key` is stored under in this cache (namespace and key prefix included), for
+    /// callers that coordinate work per entry, such as a registry of loads in progress.
+    pub fn entry_key<K: CacheKey>(&self, cache_key: &K) -> InternalCacheKey {
+        self.sized_key(cache_key)
+    }
+
     fn sized_key<K: CacheKey>(&self, cache_key: &K) -> InternalCacheKey {
         let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
         cache_key.write_key(&mut builder);
