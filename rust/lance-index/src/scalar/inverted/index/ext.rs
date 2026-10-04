@@ -78,21 +78,30 @@ impl InvertedPartition {
     }
 
     /// Loads the per-token document counts (and scores) of the whole partition in two requests, so
-    /// [`Self::doc_freq`] is answered from memory afterwards. Worth it once a query looks up more than
-    /// a few dozen tokens (a regex expansion): it costs about 8 bytes per dictionary token, once,
-    /// instead of two requests per token. Not for point queries.
+    /// [`Self::doc_freq`] and the bulk reads are answered from memory afterwards and can bridge the
+    /// rows between scattered tokens. Worth it once a query looks up thousands of tokens (a regex
+    /// expansion): it costs about 8 bytes per dictionary token, once per partition. Not for point
+    /// queries, and across many partitions it adds up; the bulk reads below work without it.
     pub async fn load_term_metadata(&self) -> Result<()> {
         self.inverted_list.ensure_metadata_loaded().await
     }
 
+    /// The document counts of `token_ids` (any order, repeats allowed), in that order: from memory
+    /// when [`Self::load_term_metadata`] was called, else reading just the `_length` rows needed in
+    /// few requests (cached per token), instead of two requests per token as [`Self::doc_freq`] does.
+    pub async fn doc_freqs(&self, token_ids: &[u32]) -> Result<Vec<u32>> {
+        let lengths = self.inverted_list.bulk_lengths(token_ids).await?;
+        Ok(token_ids.iter().map(|token| lengths[token]).collect())
+    }
+
     /// Cursors over many tokens' documents, in the order of `token_ids` (repeats allowed), read in a
-    /// few coalesced requests instead of several per token, and cached per token.
+    /// few coalesced requests instead of several per token, and cached per token. Concurrent callers
+    /// wanting the same token share one read.
     ///
-    /// Use it when a query opens many cursors at once (thousands of terms of a regex): requests grow
-    /// with the spread of the tokens in the dictionary, not with their number. It loads the
-    /// partition's per-token metadata (see [`Self::load_term_metadata`]); for a handful of tokens
-    /// [`Self::posting_cursor`] is cheaper. Rows between wanted ones may be read and discarded, so it
-    /// reads somewhat more bytes than the per-token path. Partitions in the legacy layout are rejected.
+    /// Use it when a query opens many cursors at once (thousands of terms of a regex), or just a few:
+    /// it costs fewer requests than [`Self::posting_cursor`] even for one token. Rows between wanted
+    /// ones are read and discarded only when their size is known (after [`Self::load_term_metadata`])
+    /// and small. Partitions in the legacy layout are rejected.
     pub async fn posting_cursors(
         &self,
         token_ids: &[u32],

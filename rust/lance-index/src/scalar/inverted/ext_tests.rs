@@ -145,10 +145,11 @@ fn batch(range: std::ops::Range<usize>) -> RecordBatch {
 }
 
 async fn build_index(name: &str, num_docs: usize, with_position: bool) -> Arc<InvertedIndex> {
-    build_index_with_cache(name, num_docs, with_position, LanceCache::no_cache()).await
+    build_index_with_cache(name, num_docs, with_position, &LanceCache::no_cache()).await
 }
 
-async fn build_index_with_cache(name: &str, num_docs: usize, with_position: bool, cache: LanceCache) -> Arc<InvertedIndex> {
+/// The index holds its cache weakly: the caller must keep `cache` alive for as long as it uses the index.
+async fn build_index_with_cache(name: &str, num_docs: usize, with_position: bool, cache: &LanceCache) -> Arc<InvertedIndex> {
     register_tokenizer(name, Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>))).unwrap();
     let dir = TempDir::default();
     let store = Arc::new(LanceIndexStore::new(
@@ -166,7 +167,7 @@ async fn build_index_with_cache(name: &str, num_docs: usize, with_position: bool
         .unwrap();
     // The directory must outlive the index: it is dropped with the test's store.
     std::mem::forget(dir);
-    InvertedIndex::load(store, None, &cache).await.unwrap()
+    InvertedIndex::load(store, None, cache).await.unwrap()
 }
 
 /// `term -> [(doc index, positions)]`, from the generator.
@@ -347,7 +348,7 @@ async fn test_bulk_cursors_equal_per_token_cursors() {
     let metrics = NoOpMetricsCollector;
     for (label, cache) in [("uncached", LanceCache::no_cache()), ("cached", LanceCache::with_capacity(64 << 20))] {
         let name = format!("rustie-test/slots-bulk-{label}");
-        let index = build_index_with_cache(&name, NUM_DOCS, true, cache).await;
+        let index = build_index_with_cache(&name, NUM_DOCS, true, &cache).await;
         for partition in index.partitions() {
             let ids = all_token_ids(partition);
             assert!(ids.len() > 50, "enough tokens to scatter requests ({})", ids.len());
@@ -362,29 +363,35 @@ async fn test_bulk_cursors_equal_per_token_cursors() {
             let sparse: Vec<u32> = ids.iter().copied().step_by(7).collect();
             let requests = [ids.clone(), shuffled, sparse, vec![ids[ids.len() / 2]]];
 
-            for with_positions in [true, false] {
-                for request in &requests {
-                    for pass in 0..2 {
-                        let mut bulk = partition.posting_cursors(request, with_positions, &metrics).await.unwrap();
-                        assert_eq!(bulk.len(), request.len());
-                        for (cursor, &token) in bulk.iter_mut().zip(request) {
-                            let mut single = partition.posting_cursor(token, with_positions, &metrics).await.unwrap();
-                            assert_eq!(cursor.len(), single.len(), "length of token {token}");
-                            assert_eq!(
-                                drain(cursor, with_positions),
-                                drain(&mut single, with_positions),
-                                "token {token} ({label}, positions {with_positions}, pass {pass})"
-                            );
+            // First without the partition's metadata resident (only the `_length` rows needed are read),
+            // then with it (rows between scattered tokens can be bridged).
+            for resident in [false, true] {
+                if resident {
+                    partition.load_term_metadata().await.unwrap();
+                }
+                for with_positions in [true, false] {
+                    for request in &requests {
+                        for pass in 0..2 {
+                            let mut bulk = partition.posting_cursors(request, with_positions, &metrics).await.unwrap();
+                            assert_eq!(bulk.len(), request.len());
+                            for (cursor, &token) in bulk.iter_mut().zip(request) {
+                                let mut single = partition.posting_cursor(token, with_positions, &metrics).await.unwrap();
+                                assert_eq!(cursor.len(), single.len(), "length of token {token}");
+                                assert_eq!(
+                                    drain(cursor, with_positions),
+                                    drain(&mut single, with_positions),
+                                    "token {token} ({label}, resident {resident}, positions {with_positions}, pass {pass})"
+                                );
+                            }
                         }
                     }
                 }
+                // Document counts, in the order asked (repeats included), equal the per-token lookups.
+                let counts = partition.doc_freqs(&requests[1]).await.unwrap();
+                for (&token, count) in requests[1].iter().zip(counts) {
+                    assert_eq!(count, partition.doc_freq(token, None).await.unwrap(), "doc_freq of token {token} (resident {resident})");
+                }
             }
-
-            // Document frequencies are the same before and after the bulk metadata load.
-            let before: Vec<u32> = futures::future::join_all(ids.iter().map(|&t| partition.doc_freq(t, None))).await.into_iter().map(Result::unwrap).collect();
-            partition.load_term_metadata().await.unwrap();
-            let after: Vec<u32> = futures::future::join_all(ids.iter().map(|&t| partition.doc_freq(t, None))).await.into_iter().map(Result::unwrap).collect();
-            assert_eq!(before, after);
         }
         assert!(unregister_tokenizer(&name));
     }
@@ -400,5 +407,51 @@ async fn test_bulk_positions_require_an_index_built_with_positions() {
     let mut cursors = partition.posting_cursors(&ids, false, &NoOpMetricsCollector).await.unwrap();
     let total: usize = cursors.iter_mut().map(|cursor| drain(cursor, false).len()).sum();
     assert!(total >= 200);
+    assert!(unregister_tokenizer(name));
+}
+
+/// Builds an index on disk and keeps its directory, so it can be loaded again (with its own object
+/// store and cache) to count reads.
+async fn build_files(name: &str, num_docs: usize) -> TempDir {
+    register_tokenizer(name, Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>))).unwrap();
+    let dir = TempDir::default();
+    let store = Arc::new(LanceIndexStore::new(Arc::new(ObjectStore::local()), dir.obj_path(), Arc::new(LanceCache::no_cache())));
+    let params = InvertedIndexParams::new(name.to_string(), Language::English).with_position(true);
+    let batches: Vec<_> = (0..num_docs).step_by(400).map(|s| Ok(batch(s..(s + 400).min(num_docs)))).collect();
+    let schema = batch(0..1).schema();
+    let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches));
+    InvertedIndexBuilder::new(params).update(Box::pin(stream), store.as_ref(), None).await.unwrap();
+    dir
+}
+
+/// Concurrent bulk reads of the same tokens must share one read per token: the cache alone does not
+/// (every caller misses before the first one has inserted), so the object-store reads of eight
+/// concurrent calls must equal those of one call.
+#[tokio::test]
+async fn test_concurrent_bulk_reads_share_one_read_per_token() {
+    let name = "rustie-test/slots-bulk-concurrent";
+    let dir = build_files(name, 1_000).await;
+    let reads = |concurrency: usize| {
+        let dir = &dir;
+        async move {
+            let object_store = Arc::new(ObjectStore::local());
+            let store = Arc::new(LanceIndexStore::new(object_store.clone(), dir.obj_path(), Arc::new(LanceCache::no_cache())));
+            // The index holds its cache weakly: keep it alive while the index is used.
+            let cache = LanceCache::with_capacity(64 << 20);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            let partition = &index.partitions()[0];
+            let ids = all_token_ids(partition);
+            object_store.io_stats_incremental();
+            let calls = (0..concurrency).map(|_| partition.posting_cursors(&ids, true, &NoOpMetricsCollector));
+            for result in futures::future::join_all(calls).await {
+                assert_eq!(result.unwrap().len(), ids.len());
+            }
+            object_store.io_stats_incremental().read_iops
+        }
+    };
+    let one = reads(1).await;
+    let eight = reads(8).await;
+    assert!(one > 0, "the bulk read touched the object store");
+    assert_eq!(eight, one, "eight concurrent calls must not re-read what one call reads");
     assert!(unregister_tokenizer(name));
 }

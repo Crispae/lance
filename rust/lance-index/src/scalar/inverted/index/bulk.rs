@@ -52,6 +52,63 @@ pub(super) fn coalesce_rows(rows: &[u32], bytes_of: impl Fn(u32) -> u64) -> Vec<
     ranges
 }
 
+/// Bulk loads in progress, so callers wanting the same token at the same time share one read
+/// (the cache alone does not do that: all of them miss, and each reads the row again).
+#[derive(Default)]
+pub(super) struct BulkInFlight {
+    /// `(is_positions, token)` -> a receiver that turns `true` once the owning call is done.
+    loading: std::sync::Mutex<HashMap<(bool, u32), tokio::sync::watch::Receiver<bool>>>,
+}
+
+/// The tokens one call has claimed; released (and waiters woken) when dropped, including when the
+/// call fails or is cancelled.
+struct Claim<'a> {
+    registry: &'a BulkInFlight,
+    is_positions: bool,
+    tokens: Vec<u32>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut loading = self.registry.loading.lock().unwrap();
+        for token in &self.tokens {
+            loading.remove(&(self.is_positions, *token));
+        }
+        drop(loading);
+        self.done.send_replace(true);
+    }
+}
+
+impl BulkInFlight {
+    /// Claims every token of `tokens` that nobody is loading; for the others returns what to wait on.
+    fn claim<'a>(&'a self, is_positions: bool, tokens: &[u32]) -> (Option<Claim<'a>>, Vec<tokio::sync::watch::Receiver<bool>>) {
+        let (done, receiver) = tokio::sync::watch::channel(false);
+        let mut loading = self.loading.lock().unwrap();
+        let mut mine = Vec::new();
+        let mut waits = Vec::new();
+        for &token in tokens {
+            match loading.get(&(is_positions, token)) {
+                Some(other) => waits.push(other.clone()),
+                None => {
+                    loading.insert((is_positions, token), receiver.clone());
+                    mine.push(token);
+                }
+            }
+        }
+        drop(loading);
+        let claim = (!mine.is_empty()).then_some(Claim { registry: self, is_positions, tokens: mine, done });
+        (claim, waits)
+    }
+}
+
+async fn wait_for_loads(waits: Vec<tokio::sync::watch::Receiver<bool>>) {
+    for mut receiver in waits {
+        // An error means the owner is gone, which is also a release.
+        let _ = receiver.wait_for(|done| *done).await;
+    }
+}
+
 /// A token's posting list as read by the bulk path: doc ids and frequencies only (no impacts, no
 /// positions; those are separate).
 #[derive(Debug, Clone, DeepSizeOf)]
@@ -82,18 +139,85 @@ impl CacheKey for TermListKey {
     }
 }
 
+/// A token's number of documents as read by the bulk path (just the `_length` column).
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct TermLength(pub(super) u32);
+
+#[derive(Debug, Clone)]
+pub struct TermLengthKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for TermLengthKey {
+    type ValueType = TermLength;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("term-length-{}", self.token_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "TermLength"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.term-length-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.token_id);
+    }
+}
+
 impl PostingListReader {
-    /// The per-token `(max_score, length)` columns, loaded in bulk once (two requests per partition,
-    /// 8 bytes per token). Only the v2 layout has them as columns.
-    async fn bulk_metadata(&self) -> Result<&LoadedPostingMetadata> {
-        if self.is_legacy_layout() {
-            return Err(Error::index("bulk posting reads need the compressed posting layout; rebuild the legacy index".to_string()));
+    /// The bulk path needs the compressed (v2) posting layout.
+    fn ensure_bulk_layout(&self) -> Result<()> {
+        if self.is_legacy_layout() || !matches!(self.metadata, PostingMetadata::V2 { .. }) {
+            return Err(Error::index("bulk posting reads need the v2 posting layout; rebuild the legacy index".to_string()));
         }
-        self.ensure_metadata_loaded().await?;
+        Ok(())
+    }
+
+    /// The per-token `(max_score, length)` columns when they are resident (see
+    /// [`InvertedPartition::load_term_metadata`]); the bulk path works without them.
+    fn resident_metadata(&self) -> Option<&LoadedPostingMetadata> {
         match &self.metadata {
-            PostingMetadata::V2 { metadata } => metadata.get().ok_or_else(|| Error::index("posting metadata was not loaded".to_string())),
-            PostingMetadata::LegacyV1 { .. } => Err(Error::index("bulk posting reads need the v2 posting layout".to_string())),
+            PostingMetadata::V2 { metadata } => metadata.get(),
+            PostingMetadata::LegacyV1 { .. } => None,
         }
+    }
+
+    /// The number of documents of each of `token_ids` (distinct or not). Resident metadata answers
+    /// from memory; otherwise only the `_length` rows needed are read (4 bytes per row, nearby rows
+    /// in one request) and cached per token, instead of two requests per token.
+    pub(super) async fn bulk_lengths(&self, token_ids: &[u32]) -> Result<HashMap<u32, u32>> {
+        self.ensure_bulk_layout()?;
+        let resident = self.resident_metadata();
+        let mut out: HashMap<u32, u32> = HashMap::new();
+        let mut missing: Vec<u32> = Vec::new();
+        let mut distinct = token_ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        for token in distinct {
+            if let Some(resident) = resident {
+                out.insert(token, resident.lengths[token as usize]);
+            } else if let Some(hit) = self.index_cache.get_with_key(&TermLengthKey { token_id: token }).await {
+                out.insert(token, hit.0);
+            } else {
+                missing.push(token);
+            }
+        }
+        if !missing.is_empty() {
+            let ranges = coalesce_rows(&missing, |_| 4);
+            let batches = self.read_row_ranges(&ranges, &[LENGTH_COL]).await?;
+            for &token in &missing {
+                let at = ranges.partition_point(|range| range.end <= token);
+                let row = (token - ranges[at].start) as usize;
+                let length = batches[at][LENGTH_COL].as_primitive::<UInt32Type>().value(row);
+                self.index_cache.insert_with_key(&TermLengthKey { token_id: token }, Arc::new(TermLength(length))).await;
+                out.insert(token, length);
+            }
+        }
+        Ok(out)
     }
 
     /// Reads `columns` of every range, in order, with bounded concurrency.
@@ -114,87 +238,136 @@ impl PostingListReader {
     }
 
     /// The posting lists of `token_ids` (any order, repeats allowed), in that order. Lists not in
-    /// the cache are read with their neighbours in few requests.
+    /// the cache are read with their neighbours in few requests; concurrent callers wanting the same
+    /// token share one read.
     pub(super) async fn bulk_term_lists(&self, token_ids: &[u32], metrics: &dyn MetricsCollector) -> Result<Vec<CompressedPostingList>> {
-        let loaded = self.bulk_metadata().await?;
+        self.ensure_bulk_layout()?;
         let mut found: HashMap<u32, CompressedPostingList> = HashMap::new();
-        let mut missing: Vec<u32> = Vec::new();
-        for &token in token_ids {
-            if found.contains_key(&token) {
-                continue;
-            }
-            match self.index_cache.get_with_key(&TermListKey { token_id: token }).await {
-                Some(hit) => {
-                    metrics.record_index_cache_hit();
-                    found.insert(token, hit.0.clone());
+        let mut pending: Vec<u32> = token_ids.to_vec();
+        pending.sort_unstable();
+        pending.dedup();
+        while !pending.is_empty() {
+            let mut missing: Vec<u32> = Vec::new();
+            for &token in &pending {
+                match self.index_cache.get_with_key(&TermListKey { token_id: token }).await {
+                    Some(hit) => {
+                        metrics.record_index_cache_hit();
+                        found.insert(token, hit.0.clone());
+                    }
+                    None => {
+                        metrics.record_index_cache_miss();
+                        missing.push(token);
+                    }
                 }
-                None => {
-                    metrics.record_index_cache_miss();
-                    missing.push(token);
-                }
             }
+            if missing.is_empty() {
+                break;
+            }
+            let (claim, waits) = self.bulk_in_flight.claim(false, &missing);
+            if let Some(claim) = claim {
+                self.read_term_lists(&claim.tokens, &mut found).await?;
+                drop(claim);
+            }
+            // What another call was loading is in the cache by now (or is claimed next round).
+            pending = missing.into_iter().filter(|token| !found.contains_key(token)).collect();
+            wait_for_loads(waits).await;
         }
-        missing.sort_unstable();
-        missing.dedup();
+        Ok(token_ids.iter().map(|token| found[token].clone()).collect())
+    }
 
-        // A posting row is roughly 3 bytes per document (block-packed ids and frequencies).
-        let ranges = coalesce_rows(&missing, |row| 32 + 3 * u64::from(loaded.lengths[row as usize]));
+    /// Reads the posting rows of `tokens`, caching and returning each.
+    async fn read_term_lists(&self, tokens: &[u32], found: &mut HashMap<u32, CompressedPostingList>) -> Result<()> {
+        let mut tokens = tokens.to_vec();
+        tokens.sort_unstable();
+        let lengths = self.bulk_lengths(&tokens).await?;
+        let resident = self.resident_metadata();
+        // A posting row is roughly 3 bytes per document (block-packed ids and frequencies). Rows
+        // whose length is not known (only between wanted ones, without resident metadata) are never
+        // bridged, so nothing unknown is read and discarded.
+        let ranges = coalesce_rows(&tokens, |row| match (lengths.get(&row), resident) {
+            (Some(length), _) => 32 + 3 * u64::from(*length),
+            (None, Some(resident)) => 32 + 3 * u64::from(resident.lengths[row as usize]),
+            (None, None) => BULK_MAX_GAP_BYTES + 1,
+        });
         let batches = self.read_row_ranges(&ranges, &[POSTING_COL]).await?;
-        for &token in &missing {
+        for &token in &tokens {
             let at = ranges.partition_point(|range| range.end <= token);
             let row = (token - ranges[at].start) as usize;
             // A copy of just this token's row: the cache must not pin the whole range's buffers.
             let one = batches[at].slice(row, 1).shrink_to_fit()?;
-            let list = CompressedPostingList::from_batch(
-                &one,
-                loaded.max_scores[token as usize],
-                loaded.lengths[token as usize],
-                self.posting_tail_codec,
-                self.block_size,
-                None,
-            )?;
+            // `max_score` only matters to BM25 ranking, which cursors do not use.
+            let max_score = resident.map_or(0.0, |resident| resident.max_scores[token as usize]);
+            let list = CompressedPostingList::from_batch(&one, max_score, lengths[&token], self.posting_tail_codec, self.block_size, None)?;
             if !self.modern_posting_is_validated(token)? {
                 self.ensure_modern_posting_validated(token, &PostingList::Compressed(list.clone())).await?;
             }
             self.index_cache.insert_with_key(&TermListKey { token_id: token }, Arc::new(TermList(list.clone()))).await;
             found.insert(token, list);
         }
-        Ok(token_ids.iter().map(|token| found[token].clone()).collect())
+        Ok(())
     }
 
     /// The positions of `token_ids` (any order, repeats allowed), in that order, read like
-    /// [`Self::bulk_term_lists`] and cached under the same keys the per-token path uses.
+    /// [`Self::bulk_term_lists`] (including sharing reads between concurrent callers) and cached under
+    /// the same keys the per-token path uses.
     pub(super) async fn bulk_positions(&self, token_ids: &[u32], metrics: &dyn MetricsCollector) -> Result<Vec<CompressedPositionStorage>> {
         let PositionsLayout::SharedStream(codec) = self.positions_layout else {
             return Err(Error::invalid_input(
                 "bulk position reads need the shared position stream; the index was built without positions or in a legacy layout".to_string(),
             ));
         };
-        let loaded = self.bulk_metadata().await?;
+        self.ensure_bulk_layout()?;
         let mut found: HashMap<u32, CompressedPositionStorage> = HashMap::new();
-        let mut missing: Vec<u32> = Vec::new();
-        for &token in token_ids {
-            if found.contains_key(&token) {
-                continue;
-            }
-            match self.index_cache.get_with_key(&PositionKey { token_id: token }).await {
-                Some(hit) => {
-                    metrics.record_index_cache_hit();
-                    found.insert(token, hit.0.clone());
+        let mut pending: Vec<u32> = token_ids.to_vec();
+        pending.sort_unstable();
+        pending.dedup();
+        while !pending.is_empty() {
+            let mut missing: Vec<u32> = Vec::new();
+            for &token in &pending {
+                match self.index_cache.get_with_key(&PositionKey { token_id: token }).await {
+                    Some(hit) => {
+                        metrics.record_index_cache_hit();
+                        found.insert(token, hit.0.clone());
+                    }
+                    None => {
+                        metrics.record_index_cache_miss();
+                        missing.push(token);
+                    }
                 }
-                None => {
-                    metrics.record_index_cache_miss();
-                    missing.push(token);
-                }
             }
+            if missing.is_empty() {
+                break;
+            }
+            let (claim, waits) = self.bulk_in_flight.claim(true, &missing);
+            if let Some(claim) = claim {
+                self.read_positions_rows(&claim.tokens, codec, &mut found).await?;
+                drop(claim);
+            }
+            pending = missing.into_iter().filter(|token| !found.contains_key(token)).collect();
+            wait_for_loads(waits).await;
         }
-        missing.sort_unstable();
-        missing.dedup();
+        Ok(token_ids.iter().map(|token| found[token].clone()).collect())
+    }
 
+    /// Reads the position rows of `tokens`, caching and returning each.
+    async fn read_positions_rows(
+        &self,
+        tokens: &[u32],
+        codec: PositionStreamCodec,
+        found: &mut HashMap<u32, CompressedPositionStorage>,
+    ) -> Result<()> {
+        let mut tokens = tokens.to_vec();
+        tokens.sort_unstable();
+        let lengths = self.bulk_lengths(&tokens).await?;
+        let resident = self.resident_metadata();
         // Positions take about a byte and a half each, and a posting holds a bit more than one.
-        let ranges = coalesce_rows(&missing, |row| 32 + 2 * u64::from(loaded.lengths[row as usize]));
+        let ranges = coalesce_rows(&tokens, |row| match (lengths.get(&row), resident) {
+            (Some(length), _) => 32 + 2 * u64::from(*length),
+            (None, Some(resident)) => 32 + 2 * u64::from(resident.lengths[row as usize]),
+            (None, None) => BULK_MAX_GAP_BYTES + 1,
+        });
         let batches = self.read_row_ranges(&ranges, &[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]).await?;
-        for &token in &missing {
+        for &token in &tokens {
             let at = ranges.partition_point(|range| range.end <= token);
             let row = (token - ranges[at].start) as usize;
             let batch = &batches[at];
@@ -204,7 +377,7 @@ impl PostingListReader {
             self.index_cache.insert_with_key(&PositionKey { token_id: token }, Arc::new(Positions(storage.clone()))).await;
             found.insert(token, storage);
         }
-        Ok(token_ids.iter().map(|token| found[token].clone()).collect())
+        Ok(())
     }
 }
 

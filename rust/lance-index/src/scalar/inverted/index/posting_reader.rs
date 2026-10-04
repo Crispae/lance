@@ -115,6 +115,9 @@ pub struct PostingListReader {
     pub(super) modern_num_docs: Option<usize>,
 
     pub(super) index_cache: WeakLanceCache,
+
+    /// Bulk loads in progress (see `bulk.rs`).
+    pub(super) bulk_in_flight: Arc<BulkInFlight>,
 }
 
 /// Per-token metadata (max_score, length) needed by the BM25 query and stats
@@ -262,6 +265,7 @@ impl PostingListReader {
             modern_postings_validated: Arc::new(AtomicBool::new(false)),
             modern_num_docs: None,
             index_cache: WeakLanceCache::from(index_cache),
+            bulk_in_flight: Arc::new(BulkInFlight::default()),
         })
     }
 
@@ -290,6 +294,7 @@ impl PostingListReader {
             modern_postings_validated: self.modern_postings_validated.clone(),
             modern_num_docs: self.modern_num_docs,
             index_cache: self.index_cache.clone(),
+            bulk_in_flight: self.bulk_in_flight.clone(),
         })
     }
 
