@@ -364,11 +364,14 @@ async fn test_bulk_cursors_equal_per_token_cursors() {
             let sparse: Vec<u32> = ids.iter().copied().step_by(7).collect();
             let requests = [ids.clone(), shuffled, sparse, vec![ids[ids.len() / 2]]];
 
-            // First without the partition's metadata resident (only the `_length` rows needed are read),
-            // then with it (rows between scattered tokens can be bridged).
-            for resident in [false, true] {
-                if resident {
-                    partition.load_term_metadata().await.unwrap();
+            // First with no counts resident (only the `_length` rows needed are read), then with the
+            // `_length` column alone, then with the full metadata (both let the bulk reads bridge the rows
+            // between scattered tokens).
+            for resident in ["none", "lengths", "metadata"] {
+                match resident {
+                    "lengths" => partition.load_term_lengths().await.unwrap(),
+                    "metadata" => partition.load_term_metadata().await.unwrap(),
+                    _ => {}
                 }
                 for with_positions in [true, false] {
                     for request in &requests {
@@ -545,5 +548,39 @@ async fn test_rows_load_the_document_columns_together() {
     for doc in [0u32, 1, 999, 1_999] {
         assert_eq!(rows.row_id(doc), index.partitions()[0].rows().await.unwrap().row_id(doc));
     }
+    assert!(unregister_tokenizer(name));
+}
+
+/// `load_term_lengths` reads the `_length` column alone: fewer bytes than the full metadata (which adds
+/// `_max_score`), and afterwards document counts cost no reads.
+#[tokio::test]
+async fn test_term_lengths_load_without_max_scores() {
+    let name = "rustie-test/slots-term-lengths";
+    let dir = build_files_in(name, 20_000, ConcreteFileVersion::V2_2).await;
+    let open = || {
+        let dir = &dir;
+        async move {
+            let object_store = Arc::new(ObjectStore::local());
+            let store = Arc::new(LanceIndexStore::new(object_store.clone(), dir.obj_path(), Arc::new(LanceCache::with_capacity(64 << 20))));
+            let cache = LanceCache::with_capacity(64 << 20);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            object_store.io_stats_incremental();
+            (object_store, index, cache)
+        }
+    };
+    let (object_store, index, _cache) = open().await;
+    let partition = &index.partitions()[0];
+    partition.load_term_lengths().await.unwrap();
+    let lengths_bytes = object_store.io_stats_incremental().read_bytes;
+    let ids = all_token_ids(partition);
+    let counts = partition.doc_freqs(&ids).await.unwrap();
+    assert_eq!(object_store.io_stats_incremental().read_iops, 0, "counts are memory lookups once the lengths are loaded");
+
+    let (object_store, index, _cache) = open().await;
+    let partition = &index.partitions()[0];
+    partition.load_term_metadata().await.unwrap();
+    let metadata_bytes = object_store.io_stats_incremental().read_bytes;
+    assert!(lengths_bytes < metadata_bytes, "lengths alone {lengths_bytes} bytes, with max scores {metadata_bytes}");
+    assert_eq!(partition.doc_freqs(&ids).await.unwrap(), counts);
     assert!(unregister_tokenizer(name));
 }

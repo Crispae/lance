@@ -186,12 +186,37 @@ impl PostingListReader {
         }
     }
 
-    /// The number of documents of each of `token_ids` (distinct or not). Resident metadata answers
+    /// Loads the whole `_length` column (one page initialization and one data read for a typical
+    /// partition, about 1 byte per token compressed), so document counts are memory lookups and the
+    /// bulk reads can bridge the rows between scattered tokens. Unlike
+    /// [`InvertedPartition::load_term_metadata`] it does not load `_max_score`, which only BM25 ranking
+    /// uses. Does nothing when either is already loaded.
+    pub(super) async fn load_term_lengths(&self) -> Result<()> {
+        self.ensure_bulk_layout()?;
+        if self.resident_metadata().is_some() {
+            return Ok(());
+        }
+        self.term_lengths
+            .get_or_try_init(|| async {
+                let batch = self.reader.get().await?.read_range(0..self.reader.num_rows(), Some(&[LENGTH_COL])).await?;
+                Ok::<_, Error>(batch[LENGTH_COL].as_primitive::<UInt32Type>().values().to_vec())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Every token's document count, when resident (from [`Self::load_term_lengths`] or the full
+    /// metadata).
+    fn known_lengths(&self) -> Option<&[u32]> {
+        self.resident_metadata().map(|resident| resident.lengths.as_slice()).or_else(|| self.term_lengths.get().map(Vec::as_slice))
+    }
+
+    /// The number of documents of each of `token_ids` (distinct or not). Resident counts answer
     /// from memory; otherwise only the `_length` rows needed are read (4 bytes per row, nearby rows
     /// in one request) and cached per token, instead of two requests per token.
     pub(super) async fn bulk_lengths(&self, token_ids: &[u32]) -> Result<HashMap<u32, u32>> {
         self.ensure_bulk_layout()?;
-        let resident = self.resident_metadata();
+        let resident = self.known_lengths();
         let mut out: HashMap<u32, u32> = HashMap::new();
         let mut missing: Vec<u32> = Vec::new();
         let mut distinct = token_ids.to_vec();
@@ -199,7 +224,7 @@ impl PostingListReader {
         distinct.dedup();
         for token in distinct {
             if let Some(resident) = resident {
-                out.insert(token, resident.lengths[token as usize]);
+                out.insert(token, resident[token as usize]);
             } else if let Some(hit) = self.index_cache.get_with_key(&TermLengthKey { token_id: token }).await {
                 out.insert(token, hit.0);
             } else {
@@ -280,13 +305,13 @@ impl PostingListReader {
         let mut tokens = tokens.to_vec();
         tokens.sort_unstable();
         let lengths = self.bulk_lengths(&tokens).await?;
-        let resident = self.resident_metadata();
+        let resident = self.known_lengths();
         // A posting row is roughly 3 bytes per document (block-packed ids and frequencies). Rows
         // whose length is not known (only between wanted ones, without resident metadata) are never
         // bridged, so nothing unknown is read and discarded.
         let ranges = coalesce_rows(&tokens, |row| match (lengths.get(&row), resident) {
             (Some(length), _) => 32 + 3 * u64::from(*length),
-            (None, Some(resident)) => 32 + 3 * u64::from(resident.lengths[row as usize]),
+            (None, Some(resident)) => 32 + 3 * u64::from(resident[row as usize]),
             (None, None) => BULK_MAX_GAP_BYTES + 1,
         });
         let batches = self.read_row_ranges(&ranges, &[POSTING_COL]).await?;
@@ -296,7 +321,7 @@ impl PostingListReader {
             // A copy of just this token's row: the cache must not pin the whole range's buffers.
             let one = batches[at].slice(row, 1).shrink_to_fit()?;
             // `max_score` only matters to BM25 ranking, which cursors do not use.
-            let max_score = resident.map_or(0.0, |resident| resident.max_scores[token as usize]);
+            let max_score = self.resident_metadata().map_or(0.0, |resident| resident.max_scores[token as usize]);
             let list = CompressedPostingList::from_batch(&one, max_score, lengths[&token], self.posting_tail_codec, self.block_size, None)?;
             if !self.modern_posting_is_validated(token)? {
                 self.ensure_modern_posting_validated(token, &PostingList::Compressed(list.clone())).await?;
@@ -359,11 +384,11 @@ impl PostingListReader {
         let mut tokens = tokens.to_vec();
         tokens.sort_unstable();
         let lengths = self.bulk_lengths(&tokens).await?;
-        let resident = self.resident_metadata();
+        let resident = self.known_lengths();
         // Positions take about a byte and a half each, and a posting holds a bit more than one.
         let ranges = coalesce_rows(&tokens, |row| match (lengths.get(&row), resident) {
             (Some(length), _) => 32 + 2 * u64::from(*length),
-            (None, Some(resident)) => 32 + 2 * u64::from(resident.lengths[row as usize]),
+            (None, Some(resident)) => 32 + 2 * u64::from(resident[row as usize]),
             (None, None) => BULK_MAX_GAP_BYTES + 1,
         });
         let batches = self.read_row_ranges(&ranges, &[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]).await?;

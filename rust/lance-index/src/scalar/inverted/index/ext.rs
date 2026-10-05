@@ -86,8 +86,16 @@ impl InvertedPartition {
         self.inverted_list.ensure_metadata_loaded().await
     }
 
+    /// Loads every token's document count of the partition (the `_length` column alone, about 1 byte
+    /// per dictionary token read, 4 bytes per token in memory), so [`Self::doc_freqs`] answers from
+    /// memory and the bulk reads can bridge the rows between scattered tokens. The cheap form of
+    /// [`Self::load_term_metadata`] for callers that never rank: it skips `_max_score`.
+    pub async fn load_term_lengths(&self) -> Result<()> {
+        self.inverted_list.load_term_lengths().await
+    }
+
     /// The document counts of `token_ids` (any order, repeats allowed), in that order: from memory
-    /// when [`Self::load_term_metadata`] was called, else reading just the `_length` rows needed in
+    /// when [`Self::load_term_lengths`] or [`Self::load_term_metadata`] was called, else reading just the `_length` rows needed in
     /// few requests (cached per token), instead of two requests per token as [`Self::doc_freq`] does.
     pub async fn doc_freqs(&self, token_ids: &[u32]) -> Result<Vec<u32>> {
         let lengths = self.inverted_list.bulk_lengths(token_ids).await?;

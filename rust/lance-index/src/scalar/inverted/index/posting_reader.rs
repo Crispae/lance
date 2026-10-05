@@ -118,6 +118,9 @@ pub struct PostingListReader {
 
     /// Bulk loads in progress (see `bulk.rs`).
     pub(super) bulk_in_flight: Arc<BulkInFlight>,
+    /// The whole `_length` column, when loaded on its own (see `bulk.rs`): the per-token document
+    /// counts without the `_max_score` column that only BM25 ranking needs.
+    pub(super) term_lengths: Arc<tokio::sync::OnceCell<Vec<u32>>>,
 }
 
 /// Per-token metadata (max_score, length) needed by the BM25 query and stats
@@ -266,6 +269,7 @@ impl PostingListReader {
             modern_num_docs: None,
             index_cache: WeakLanceCache::from(index_cache),
             bulk_in_flight: Arc::new(BulkInFlight::default()),
+            term_lengths: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -295,6 +299,7 @@ impl PostingListReader {
             modern_num_docs: self.modern_num_docs,
             index_cache: self.index_cache.clone(),
             bulk_in_flight: self.bulk_in_flight.clone(),
+            term_lengths: self.term_lengths.clone(),
         })
     }
 
