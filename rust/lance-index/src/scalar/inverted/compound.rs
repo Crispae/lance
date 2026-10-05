@@ -248,23 +248,38 @@ fn checked_score(score: f32, context: &str) -> Result<f32> {
     }
 }
 
-/// Internal document-at-a-time scorer protocol for compound FTS.
+/// A sorted, seekable stream of partition-local document ids with an optional two-phase check.
 ///
-/// Implementations iterate matching partition-local document ids in ascending
-/// order and expose the corresponding candidate key separately. A collector
-/// may shallow-advance independently of the exact iterator, inspect a
-/// conservative range bound, and monotonically raise the competitive score.
-/// `matches` is the optional two-phase confirmation hook: cheap approximations
-/// return a candidate from `next` / `advance` and defer expensive checks such
-/// as phrase positions until confirmation.
-pub(super) trait ComposableScorer: Send {
+/// Implementations iterate matching document ids in ascending order and expose the corresponding
+/// candidate key separately. `matches` is the optional two-phase confirmation hook: cheap
+/// approximations return a candidate from `next` / `advance` and defer expensive checks such as
+/// phrase positions until confirmation. This is the scoring-free half of [`ComposableScorer`], so
+/// callers that need exhaustive matches (no ranking) can build conjunctions and disjunctions
+/// without a scorer.
+pub trait DocIterator: Send {
     fn doc(&self) -> Option<u64>;
     fn document_key(&self) -> Option<u64> {
         self.doc()
     }
     fn next(&mut self) -> Result<Option<u64>>;
     fn advance(&mut self, target: u64) -> Result<Option<u64>>;
+    /// Estimated number of documents the iterator yields; conjunctions drive from the cheapest.
     fn cost(&self) -> usize;
+    /// Two-phase confirmation of the current document (default: always a match).
+    fn matches(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+    /// Estimated relative cost of [`Self::matches`], stable for this iterator's lifetime. `None`
+    /// means no ordering hint, not that confirmation may be skipped.
+    fn match_cost(&self) -> Option<f32> {
+        None
+    }
+}
+
+/// Internal document-at-a-time scorer protocol for compound FTS: a [`DocIterator`] that also
+/// scores. A collector may shallow-advance independently of the exact iterator, inspect a
+/// conservative range bound, and monotonically raise the competitive score.
+pub(super) trait ComposableScorer: DocIterator {
     fn score(&mut self) -> Result<f32>;
     fn advance_shallow(&mut self, target: u64) -> Result<u64>;
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds>;
@@ -285,16 +300,6 @@ pub(super) trait ComposableScorer: Send {
         false
     }
 
-    fn matches(&mut self) -> Result<bool> {
-        Ok(true)
-    }
-
-    /// Estimated relative cost of [`Self::matches`], stable for this scorer's
-    /// lifetime. `None` means no ordering hint, not that confirmation may be skipped.
-    fn match_cost(&self) -> Option<f32> {
-        None
-    }
-
     fn scores_non_negative(&self) -> bool {
         false
     }
@@ -302,7 +307,7 @@ pub(super) trait ComposableScorer: Send {
 
 pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 
-fn sum_global_score_upper_bounds(children: &[BoxScorer<'_>]) -> Option<f32> {
+fn sum_global_score_upper_bounds<C: ComposableScorer + ?Sized>(children: &[Box<C>]) -> Option<f32> {
     children.iter().try_fold(0.0, |upper, child| {
         let child_upper = child.global_score_upper_bound()?;
         if !child_upper.is_finite() || child_upper < 0.0 {
@@ -741,27 +746,31 @@ impl CompoundScorerPlan {
     }
 }
 
-impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
+impl<D: WandDocuments + Sync> DocIterator for WandCursor<'_, D> {
     fn doc(&self) -> Option<u64> {
         self.doc()
     }
-
     fn document_key(&self) -> Option<u64> {
         self.document_key()
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         self.next()
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         self.advance(target)
     }
-
     fn cost(&self) -> usize {
         self.cost()
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.matches()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.match_cost()
+    }
+}
 
+impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
     fn score(&mut self) -> Result<f32> {
         self.current_score()
     }
@@ -791,14 +800,6 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.match_cost().is_some()
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.matches()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.match_cost()
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -950,15 +951,13 @@ impl MaterializedScorer {
     }
 }
 
-impl ComposableScorer for MaterializedScorer {
+impl DocIterator for MaterializedScorer {
     fn doc(&self) -> Option<u64> {
         self.index.map(|index| self.rows[index].row_id)
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         self.position_at(self.index.map_or(0, |index| index + 1))
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.doc().is_some_and(|doc| doc >= target) {
             return Ok(self.doc());
@@ -967,11 +966,12 @@ impl ComposableScorer for MaterializedScorer {
         let offset = self.rows[start..].partition_point(|row| row.row_id < target);
         self.position_at(start + offset)
     }
-
     fn cost(&self) -> usize {
         self.rows.len()
     }
+}
 
+impl ComposableScorer for MaterializedScorer {
     fn score(&mut self) -> Result<f32> {
         self.index
             .map(|index| self.rows[index].score)
@@ -1128,15 +1128,13 @@ impl<'a> RowAddressScorer<'a> {
     }
 }
 
-impl ComposableScorer for RowAddressScorer<'_> {
+impl DocIterator for RowAddressScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current
     }
-
     fn document_key(&self) -> Option<u64> {
         self.current
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         if self.exhausted {
             return Ok(None);
@@ -1144,7 +1142,6 @@ impl ComposableScorer for RowAddressScorer<'_> {
         let source_doc = self.source.next()?;
         self.set_source_position(source_doc)
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
@@ -1174,11 +1171,19 @@ impl ComposableScorer for RowAddressScorer<'_> {
         }
         Ok(row_address)
     }
-
     fn cost(&self) -> usize {
         self.source.cost().min(self.projection.live_len())
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_positioned()?;
+        self.source.matches()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.source.match_cost()
+    }
+}
 
+impl ComposableScorer for RowAddressScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         self.ensure_positioned()?;
         self.source.score()
@@ -1272,15 +1277,6 @@ impl ComposableScorer for RowAddressScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.source.supports_doc_local_confirmation_pruning()
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.ensure_positioned()?;
-        self.source.matches()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.source.match_cost()
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -1677,15 +1673,13 @@ impl<'a> RowAddressMergeScorer<'a> {
     }
 }
 
-impl ComposableScorer for RowAddressMergeScorer<'_> {
+impl DocIterator for RowAddressMergeScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current.map(|(doc, _)| doc)
     }
-
     fn document_key(&self) -> Option<u64> {
         self.doc()
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         let target = match self.current.take() {
             Some((u64::MAX, source_index)) => {
@@ -1702,7 +1696,6 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
         };
         self.select_current(target)
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.doc().is_some_and(|doc| doc >= target) {
             return Ok(self.doc());
@@ -1722,14 +1715,26 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
         }
         self.select_current(target)
     }
-
     fn cost(&self) -> usize {
         self.sources
             .iter()
             .map(|source| source.cost())
             .fold(0, usize::saturating_add)
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.current_source_mut()?.matches()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.sources
+            .iter()
+            .map(|source| source.match_cost())
+            .try_fold(0.0_f32, |cost, source_cost| {
+                source_cost.map(|source_cost| cost.max(source_cost))
+            })
+    }
+}
 
+impl ComposableScorer for RowAddressMergeScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         self.current_source_mut()?.score()
     }
@@ -1825,19 +1830,6 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
         self.sources
             .iter()
             .any(|source| source.supports_doc_local_confirmation_pruning())
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.current_source_mut()?.matches()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.sources
-            .iter()
-            .map(|source| source.match_cost())
-            .try_fold(0.0_f32, |cost, source_cost| {
-                source_cost.map(|source_cost| cost.max(source_cost))
-            })
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -2206,23 +2198,22 @@ pub(super) enum DisjunctionScore {
 
 pub(super) struct EmptyScorer;
 
-impl ComposableScorer for EmptyScorer {
+impl DocIterator for EmptyScorer {
     fn doc(&self) -> Option<u64> {
         None
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         Ok(None)
     }
-
     fn advance(&mut self, _target: u64) -> Result<Option<u64>> {
         Ok(None)
     }
-
     fn cost(&self) -> usize {
         0
     }
+}
 
+impl ComposableScorer for EmptyScorer {
     fn score(&mut self) -> Result<f32> {
         Err(Error::internal(
             "score requested from an empty compound FTS scorer",
@@ -2279,27 +2270,31 @@ impl<'a> ScaleScorer<'a> {
     }
 }
 
-impl ComposableScorer for ScaleScorer<'_> {
+impl DocIterator for ScaleScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.child.doc()
     }
-
     fn document_key(&self) -> Option<u64> {
         self.child.document_key()
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         self.child.next()
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         self.child.advance(target)
     }
-
     fn cost(&self) -> usize {
         self.child.cost()
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.child.matches()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.child.match_cost()
+    }
+}
 
+impl ComposableScorer for ScaleScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         checked_score(self.child.score()? * self.factor, "MatchQuery boost")
     }
@@ -2358,22 +2353,15 @@ impl ComposableScorer for ScaleScorer<'_> {
         self.child.supports_doc_local_confirmation_pruning()
     }
 
-    fn matches(&mut self) -> Result<bool> {
-        self.child.matches()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.child.match_cost()
-    }
-
     fn scores_non_negative(&self) -> bool {
         self.child.scores_non_negative()
     }
 }
 
 /// Union scorer used for Boolean SHOULD sums and MultiMatch DisMax.
-pub(super) struct DisjunctionScorer<'a> {
-    children: Vec<BoxScorer<'a>>,
+pub(super) struct DisjunctionScorer<'a, C: ?Sized + 'a = dyn ComposableScorer + 'a> {
+    children: Vec<Box<C>>,
+    _lifetime: std::marker::PhantomData<&'a ()>,
     mode: DisjunctionScore,
     current: Option<u64>,
     confirmed_doc: Option<u64>,
@@ -2381,8 +2369,8 @@ pub(super) struct DisjunctionScorer<'a> {
     min_competitive_score: f32,
 }
 
-impl<'a> DisjunctionScorer<'a> {
-    pub(super) fn try_new(children: Vec<BoxScorer<'a>>, mode: DisjunctionScore) -> Result<Self> {
+impl<'a, C: DocIterator + ?Sized + 'a> DisjunctionScorer<'a, C> {
+    pub(super) fn try_new(children: Vec<Box<C>>, mode: DisjunctionScore) -> Result<Self> {
         if children.is_empty() {
             return Err(Error::internal(
                 "FTS disjunction scorer requires at least one child",
@@ -2391,6 +2379,7 @@ impl<'a> DisjunctionScorer<'a> {
         let confirmed = vec![false; children.len()];
         Ok(Self {
             children,
+            _lifetime: std::marker::PhantomData,
             mode,
             current: None,
             confirmed_doc: None,
@@ -2424,11 +2413,10 @@ impl<'a> DisjunctionScorer<'a> {
     }
 }
 
-impl ComposableScorer for DisjunctionScorer<'_> {
+impl<C: DocIterator + ?Sized> DocIterator for DisjunctionScorer<'_, C> {
     fn doc(&self) -> Option<u64> {
         self.current
     }
-
     fn document_key(&self) -> Option<u64> {
         let current = self.current?;
         self.children
@@ -2436,7 +2424,6 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             .find(|child| child.doc() == Some(current))
             .and_then(|child| child.document_key())
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         match self.current {
             None => {
@@ -2454,7 +2441,6 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         }
         Ok(self.set_current_from_children())
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
@@ -2466,14 +2452,24 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         }
         Ok(self.set_current_from_children())
     }
-
     fn cost(&self) -> usize {
         self.children
             .iter()
             .map(|child| child.cost())
             .fold(0, usize::saturating_add)
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .filter_map(|child| child.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
 
+impl<C: ComposableScorer + ?Sized> ComposableScorer for DisjunctionScorer<'_, C> {
     fn score(&mut self) -> Result<f32> {
         if !self.ensure_confirmed()? {
             return Err(Error::internal(
@@ -2603,17 +2599,6 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             .any(|child| child.supports_doc_local_confirmation_pruning())
     }
 
-    fn matches(&mut self) -> Result<bool> {
-        self.ensure_confirmed()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.children
-            .iter()
-            .filter_map(|child| child.match_cost())
-            .reduce(|left, right| left + right)
-    }
-
     fn scores_non_negative(&self) -> bool {
         self.children
             .iter()
@@ -2622,8 +2607,9 @@ impl ComposableScorer for DisjunctionScorer<'_> {
 }
 
 /// Intersection scorer that requires and scores every Boolean MUST child.
-pub(super) struct RequiredConjunctionScorer<'a> {
-    children: Vec<BoxScorer<'a>>,
+pub(super) struct RequiredConjunctionScorer<'a, C: ?Sized + 'a = dyn ComposableScorer + 'a> {
+    children: Vec<Box<C>>,
+    _lifetime: std::marker::PhantomData<&'a ()>,
     /// Child indices sorted by approximation cost, omitted when query order is
     /// already cheapest-first. `children` remains in query order so scoring and
     /// score-bound arithmetic stay bit-for-bit stable.
@@ -2636,8 +2622,8 @@ pub(super) struct RequiredConjunctionScorer<'a> {
     confirmed: bool,
 }
 
-fn align_conjunction_children(
-    children: &mut [BoxScorer<'_>],
+pub(super) fn align_conjunction_children<C: DocIterator + ?Sized>(
+    children: &mut [Box<C>],
     mut target: u64,
     child_index: impl Fn(usize) -> usize,
 ) -> Result<Option<u64>> {
@@ -2662,10 +2648,7 @@ fn align_conjunction_children(
     }
 }
 
-fn compare_confirmation_cost(
-    left: &dyn ComposableScorer,
-    right: &dyn ComposableScorer,
-) -> Ordering {
+fn compare_confirmation_cost<C: DocIterator + ?Sized>(left: &C, right: &C) -> Ordering {
     match (left.match_cost(), right.match_cost()) {
         (Some(left), Some(right)) => left.total_cmp(&right),
         (Some(_), None) => Ordering::Less,
@@ -2674,8 +2657,8 @@ fn compare_confirmation_cost(
     }
 }
 
-fn confirm_conjunction_children(
-    children: &mut [BoxScorer<'_>],
+fn confirm_conjunction_children<C: DocIterator + ?Sized>(
+    children: &mut [Box<C>],
     child_index: impl Fn(usize) -> usize,
 ) -> Result<bool> {
     for position in 0..children.len() {
@@ -2686,8 +2669,8 @@ fn confirm_conjunction_children(
     Ok(true)
 }
 
-impl<'a> RequiredConjunctionScorer<'a> {
-    pub(super) fn try_new(children: Vec<BoxScorer<'a>>) -> Result<Self> {
+impl<'a, C: DocIterator + ?Sized + 'a> RequiredConjunctionScorer<'a, C> {
+    pub(super) fn try_new(children: Vec<Box<C>>) -> Result<Self> {
         if children.is_empty() {
             return Err(Error::internal(
                 "FTS conjunction scorer requires at least one child",
@@ -2726,6 +2709,7 @@ impl<'a> RequiredConjunctionScorer<'a> {
         };
         Ok(Self {
             children,
+            _lifetime: std::marker::PhantomData,
             approximation_order,
             confirmation_order,
             current: None,
@@ -2764,15 +2748,13 @@ impl<'a> RequiredConjunctionScorer<'a> {
     }
 }
 
-impl ComposableScorer for RequiredConjunctionScorer<'_> {
+impl<C: DocIterator + ?Sized> DocIterator for RequiredConjunctionScorer<'_, C> {
     fn doc(&self) -> Option<u64> {
         self.current
     }
-
     fn document_key(&self) -> Option<u64> {
         self.children.first().and_then(|child| child.document_key())
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         let target = match self.current {
             None => 0,
@@ -2781,14 +2763,12 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         };
         self.align(target)
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
         self.align(target)
     }
-
     fn cost(&self) -> usize {
         self.children
             .iter()
@@ -2796,7 +2776,18 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
             .min()
             .unwrap_or(0)
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .filter_map(|child| child.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
 
+impl<C: ComposableScorer + ?Sized> ComposableScorer for RequiredConjunctionScorer<'_, C> {
     fn score(&mut self) -> Result<f32> {
         if !self.ensure_confirmed()? {
             return Err(Error::internal(
@@ -2876,17 +2867,6 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
             .any(|child| child.supports_doc_local_confirmation_pruning())
     }
 
-    fn matches(&mut self) -> Result<bool> {
-        self.ensure_confirmed()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.children
-            .iter()
-            .filter_map(|child| child.match_cost())
-            .reduce(|left, right| left + right)
-    }
-
     fn scores_non_negative(&self) -> bool {
         self.children
             .iter()
@@ -2942,29 +2922,33 @@ impl<'a> BoostScorer<'a> {
     }
 }
 
-impl ComposableScorer for BoostScorer<'_> {
+impl DocIterator for BoostScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.positive.doc()
     }
-
     fn document_key(&self) -> Option<u64> {
         self.positive.document_key()
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         self.reset_confirmation();
         self.positive.next()
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         self.reset_confirmation();
         self.positive.advance(target)
     }
-
     fn cost(&self) -> usize {
         self.positive.cost()
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.positive.matches()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.positive.match_cost()
+    }
+}
 
+impl ComposableScorer for BoostScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         let positive = self.positive.score()?;
         let score = if self.confirm_negative()? {
@@ -3015,14 +2999,6 @@ impl ComposableScorer for BoostScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.positive.supports_doc_local_confirmation_pruning()
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.positive.matches()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.positive.match_cost()
     }
 }
 
@@ -3249,15 +3225,13 @@ impl<'a> ReqOptScorer<'a> {
     }
 }
 
-impl ComposableScorer for ReqOptScorer<'_> {
+impl DocIterator for ReqOptScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current
     }
-
     fn document_key(&self) -> Option<u64> {
         self.required.document_key()
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         let target = match self.current {
             None => 0,
@@ -3266,18 +3240,28 @@ impl ComposableScorer for ReqOptScorer<'_> {
         };
         self.position(target)
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
         self.position(target)
     }
-
     fn cost(&self) -> usize {
         self.required.cost()
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.required
+            .match_cost()
+            .into_iter()
+            .chain(self.optional.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
 
+impl ComposableScorer for ReqOptScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         if !self.ensure_confirmed()? {
             return Err(Error::internal(
@@ -3385,18 +3369,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.required.supports_doc_local_confirmation_pruning()
             || self.optional.supports_doc_local_confirmation_pruning()
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.ensure_confirmed()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.required
-            .match_cost()
-            .into_iter()
-            .chain(self.optional.match_cost())
-            .reduce(|left, right| left + right)
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -3547,30 +3519,47 @@ impl<'a> BooleanScorer<'a> {
     }
 }
 
-impl ComposableScorer for BooleanScorer<'_> {
+impl DocIterator for BooleanScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current
     }
-
     fn document_key(&self) -> Option<u64> {
         self.driver.document_key()
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         self.next_candidate(None)
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
         self.next_candidate(Some(target))
     }
-
     fn cost(&self) -> usize {
         self.driver.cost()
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.driver
+            .match_cost()
+            .into_iter()
+            .chain(
+                self.optional
+                    .as_ref()
+                    .and_then(|optional| optional.match_cost()),
+            )
+            .chain(
+                self.prohibited
+                    .as_ref()
+                    .and_then(|prohibited| prohibited.match_cost()),
+            )
+            .reduce(|left, right| left + right)
+    }
+}
 
+impl ComposableScorer for BooleanScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         if !self.ensure_confirmed()? {
             return Err(Error::internal(
@@ -3680,27 +3669,6 @@ impl ComposableScorer for BooleanScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.defer_confirmation
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.ensure_confirmed()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.driver
-            .match_cost()
-            .into_iter()
-            .chain(
-                self.optional
-                    .as_ref()
-                    .and_then(|optional| optional.match_cost()),
-            )
-            .chain(
-                self.prohibited
-                    .as_ref()
-                    .and_then(|prohibited| prohibited.match_cost()),
-            )
-            .reduce(|left, right| left + right)
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -4779,11 +4747,10 @@ mod tests {
         confirmations: Arc<AtomicUsize>,
     }
 
-    impl ComposableScorer for TwoPhaseScorer {
+    impl DocIterator for TwoPhaseScorer {
         fn doc(&self) -> Option<u64> {
             self.inner.doc()
         }
-
         fn next(&mut self) -> Result<Option<u64>> {
             let doc = self.inner.next()?;
             if doc.is_some() {
@@ -4791,7 +4758,6 @@ mod tests {
             }
             Ok(doc)
         }
-
         fn advance(&mut self, target: u64) -> Result<Option<u64>> {
             let doc = self.inner.advance(target)?;
             if doc.is_some() {
@@ -4799,11 +4765,21 @@ mod tests {
             }
             Ok(doc)
         }
-
         fn cost(&self) -> usize {
             self.inner.cost()
         }
+        fn matches(&mut self) -> Result<bool> {
+            self.confirmations.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(self
+                .doc()
+                .is_some_and(|doc| self.accepted.binary_search(&doc).is_ok()))
+        }
+        fn match_cost(&self) -> Option<f32> {
+            self.match_cost
+        }
+    }
 
+    impl ComposableScorer for TwoPhaseScorer {
         fn score(&mut self) -> Result<f32> {
             self.inner.score()
         }
@@ -4834,17 +4810,6 @@ mod tests {
 
         fn supports_doc_local_confirmation_pruning(&self) -> bool {
             true
-        }
-
-        fn matches(&mut self) -> Result<bool> {
-            self.confirmations.fetch_add(1, AtomicOrdering::Relaxed);
-            Ok(self
-                .doc()
-                .is_some_and(|doc| self.accepted.binary_search(&doc).is_ok()))
-        }
-
-        fn match_cost(&self) -> Option<f32> {
-            self.match_cost
         }
 
         fn scores_non_negative(&self) -> bool {
@@ -4909,15 +4874,13 @@ mod tests {
         work: Arc<ScorerWork>,
     }
 
-    impl ComposableScorer for InstrumentedScorer<'_> {
+    impl DocIterator for InstrumentedScorer<'_> {
         fn doc(&self) -> Option<u64> {
             self.inner.doc()
         }
-
         fn document_key(&self) -> Option<u64> {
             self.inner.document_key()
         }
-
         fn next(&mut self) -> Result<Option<u64>> {
             let doc = self.inner.next()?;
             if doc.is_some() {
@@ -4925,7 +4888,6 @@ mod tests {
             }
             Ok(doc)
         }
-
         fn advance(&mut self, target: u64) -> Result<Option<u64>> {
             let doc = self.inner.advance(target)?;
             if doc.is_some() {
@@ -4933,11 +4895,21 @@ mod tests {
             }
             Ok(doc)
         }
-
         fn cost(&self) -> usize {
             self.inner.cost()
         }
+        fn matches(&mut self) -> Result<bool> {
+            self.work
+                .confirmations
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.matches()
+        }
+        fn match_cost(&self) -> Option<f32> {
+            self.inner.match_cost()
+        }
+    }
 
+    impl ComposableScorer for InstrumentedScorer<'_> {
         fn score(&mut self) -> Result<f32> {
             self.inner.score()
         }
@@ -4969,17 +4941,6 @@ mod tests {
 
         fn supports_doc_local_confirmation_pruning(&self) -> bool {
             self.inner.supports_doc_local_confirmation_pruning()
-        }
-
-        fn matches(&mut self) -> Result<bool> {
-            self.work
-                .confirmations
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            self.inner.matches()
-        }
-
-        fn match_cost(&self) -> Option<f32> {
-            self.inner.match_cost()
         }
 
         fn scores_non_negative(&self) -> bool {
@@ -5445,23 +5406,22 @@ mod tests {
         inner: MaterializedScorer,
     }
 
-    impl ComposableScorer for UnboundedScorer {
+    impl DocIterator for UnboundedScorer {
         fn doc(&self) -> Option<u64> {
             self.inner.doc()
         }
-
         fn next(&mut self) -> Result<Option<u64>> {
             self.inner.next()
         }
-
         fn advance(&mut self, target: u64) -> Result<Option<u64>> {
             self.inner.advance(target)
         }
-
         fn cost(&self) -> usize {
             self.inner.cost()
         }
+    }
 
+    impl ComposableScorer for UnboundedScorer {
         fn score(&mut self) -> Result<f32> {
             self.inner.score()
         }
@@ -5489,24 +5449,26 @@ mod tests {
         advance_calls: Arc<AtomicUsize>,
     }
 
-    impl ComposableScorer for CountingScorer {
+    impl DocIterator for CountingScorer {
         fn doc(&self) -> Option<u64> {
             self.inner.doc()
         }
-
         fn next(&mut self) -> Result<Option<u64>> {
             self.inner.next()
         }
-
         fn advance(&mut self, target: u64) -> Result<Option<u64>> {
             self.advance_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.advance(target)
         }
-
         fn cost(&self) -> usize {
             self.cost
         }
+        fn matches(&mut self) -> Result<bool> {
+            self.inner.matches()
+        }
+    }
 
+    impl ComposableScorer for CountingScorer {
         fn score(&mut self) -> Result<f32> {
             self.inner.score()
         }
@@ -5525,10 +5487,6 @@ mod tests {
 
         fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
             self.inner.set_min_competitive_score(min_score)
-        }
-
-        fn matches(&mut self) -> Result<bool> {
-            self.inner.matches()
         }
 
         fn scores_non_negative(&self) -> bool {

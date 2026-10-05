@@ -6,6 +6,7 @@ mod cache_codec;
 mod combined;
 mod compound;
 mod cross_column;
+pub mod docset;
 mod documents;
 mod encoding;
 #[cfg(test)]
@@ -43,6 +44,7 @@ pub use compound::{
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
+pub use docset::DocIterator;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};

@@ -399,11 +399,10 @@ impl<'a> ShouldMaxScoreScorer<'a> {
     }
 }
 
-impl ComposableScorer for ShouldMaxScoreScorer<'_> {
+impl DocIterator for ShouldMaxScoreScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current
     }
-
     fn document_key(&self) -> Option<u64> {
         let current = self.current?;
         self.children
@@ -411,7 +410,6 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
             .find(|child| child.doc() == Some(current))
             .and_then(|child| child.document_key())
     }
-
     fn next(&mut self) -> Result<Option<u64>> {
         if self.exhausted {
             return Ok(None);
@@ -434,7 +432,6 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
         self.reset_current();
         self.position(current + 1)
     }
-
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
@@ -448,14 +445,24 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
         self.window = None;
         self.position(target)
     }
-
     fn cost(&self) -> usize {
         self.children
             .iter()
             .map(|child| child.cost())
             .fold(0, usize::saturating_add)
     }
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+    fn match_cost(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .filter_map(|child| child.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
 
+impl ComposableScorer for ShouldMaxScoreScorer<'_> {
     fn score(&mut self) -> Result<f32> {
         if !self.ensure_confirmed()? {
             return Err(Error::internal(
@@ -577,17 +584,6 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
         self.children
             .iter()
             .any(|child| child.supports_doc_local_confirmation_pruning())
-    }
-
-    fn matches(&mut self) -> Result<bool> {
-        self.ensure_confirmed()
-    }
-
-    fn match_cost(&self) -> Option<f32> {
-        self.children
-            .iter()
-            .filter_map(|child| child.match_cost())
-            .reduce(|left, right| left + right)
     }
 
     fn scores_non_negative(&self) -> bool {
