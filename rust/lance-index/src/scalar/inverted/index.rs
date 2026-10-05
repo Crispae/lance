@@ -116,6 +116,7 @@ mod posting_reader;
 mod prewarm;
 mod search;
 mod search_candidates;
+mod sidecar;
 mod token_set;
 
 pub use bulk::*;
@@ -129,6 +130,7 @@ pub use inverted_index::*;
 pub use partition::*;
 pub(super) use posting_batch_builder::*;
 pub use posting_builder::*;
+pub use sidecar::*;
 pub use posting_list::*;
 pub use posting_reader::*;
 use prewarm::*;

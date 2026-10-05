@@ -584,3 +584,60 @@ async fn test_term_lengths_load_without_max_scores() {
     assert_eq!(partition.doc_freqs(&ids).await.unwrap(), counts);
     assert!(unregister_tokenizer(name));
 }
+
+/// The RustIE side file (prototype): cursors read from it equal the posting file's for every token,
+/// with and without positions, and a cold positional read of scattered tokens costs fewer requests
+/// than the bulk path over the posting file's three columns.
+#[tokio::test]
+async fn test_sidecar_cursors_equal_posting_file_cursors() {
+    let name = "rustie-test/slots-sidecar";
+    let dir = build_files_in(name, 20_000, ConcreteFileVersion::V2_2).await;
+    let open = || {
+        let dir = &dir;
+        async move {
+            let object_store = Arc::new(ObjectStore::local());
+            let store = Arc::new(LanceIndexStore::with_format_version(object_store.clone(), dir.obj_path(), Arc::new(LanceCache::with_capacity(64 << 20)), ConcreteFileVersion::V2_2));
+            let cache = LanceCache::with_capacity(64 << 20);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            (object_store, index, cache)
+        }
+    };
+    let (_, index, _cache) = open().await;
+    index.partitions()[0].write_term_sidecar().await.unwrap();
+
+    let (_, index, _cache) = open().await;
+    let partition = &index.partitions()[0];
+    let ids = all_token_ids(partition);
+    for with_positions in [false, true] {
+        let mut side = partition.posting_cursors_from_sidecar(&ids, with_positions).await.unwrap();
+        for (cursor, &token) in side.iter_mut().zip(&ids) {
+            let mut single = partition.posting_cursor(token, with_positions, &NoOpMetricsCollector).await.unwrap();
+            assert_eq!(cursor.len(), single.len(), "length of token {token}");
+            assert_eq!(drain(cursor, with_positions), drain(&mut single, with_positions), "token {token}, positions {with_positions}");
+        }
+    }
+
+    // Reads of a positional request for scattered tokens, on a fresh open whose counts are loaded and
+    // whose file was opened by a first request (so only the token rows are counted).
+    let scattered: Vec<u32> = ids.iter().copied().step_by(ids.len() / 8).collect();
+    let (first, rest) = scattered.split_first().unwrap();
+    let mut reads = Vec::new();
+    for from_sidecar in [false, true] {
+        let (object_store, index, _cache) = open().await;
+        let partition = &index.partitions()[0];
+        partition.load_term_lengths().await.unwrap();
+        let first = std::slice::from_ref(first);
+        if from_sidecar {
+            partition.posting_cursors_from_sidecar(first, false).await.unwrap();
+            object_store.io_stats_incremental();
+            partition.posting_cursors_from_sidecar(rest, true).await.unwrap();
+        } else {
+            partition.posting_cursors(first, false, &NoOpMetricsCollector).await.unwrap();
+            object_store.io_stats_incremental();
+            partition.posting_cursors(rest, true, &NoOpMetricsCollector).await.unwrap();
+        }
+        reads.push(object_store.io_stats_incremental().read_iops);
+    }
+    assert!(reads[1] < reads[0], "positional reads of {} scattered tokens: side file {}, posting file {}", rest.len(), reads[1], reads[0]);
+    assert!(unregister_tokenizer(name));
+}

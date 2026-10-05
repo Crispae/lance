@@ -19,11 +19,11 @@ use super::*;
 
 /// Rows closer than this many bytes (estimated) are read in one range, discarding what lies between
 /// them: one more request costs more than reading this much extra.
-const BULK_MAX_GAP_BYTES: u64 = 512 * 1024;
+pub(super) const BULK_MAX_GAP_BYTES: u64 = 512 * 1024;
 /// A range stops growing at the size Lance reads in one piece anyway.
 const BULK_MAX_RANGE_BYTES: u64 = 8 * 1024 * 1024;
 /// Ranges read concurrently.
-const BULK_READ_CONCURRENCY: usize = 16;
+pub(super) const BULK_READ_CONCURRENCY: usize = 16;
 
 /// Groups the ascending, distinct `rows` into ranges to read, each at most [`BULK_MAX_RANGE_BYTES`]
 /// and never bridging more than [`BULK_MAX_GAP_BYTES`] of unwanted rows, by the byte estimate
@@ -62,10 +62,10 @@ pub(super) struct BulkInFlight {
 
 /// The tokens one call has claimed; released (and waiters woken) when dropped, including when the
 /// call fails or is cancelled.
-struct Claim<'a> {
+pub(super) struct Claim<'a> {
     registry: &'a BulkInFlight,
     is_positions: bool,
-    tokens: Vec<u32>,
+    pub(super) tokens: Vec<u32>,
     done: tokio::sync::watch::Sender<bool>,
 }
 
@@ -82,7 +82,7 @@ impl Drop for Claim<'_> {
 
 impl BulkInFlight {
     /// Claims every token of `tokens` that nobody is loading; for the others returns what to wait on.
-    fn claim<'a>(&'a self, is_positions: bool, tokens: &[u32]) -> (Option<Claim<'a>>, Vec<tokio::sync::watch::Receiver<bool>>) {
+    pub(super) fn claim<'a>(&'a self, is_positions: bool, tokens: &[u32]) -> (Option<Claim<'a>>, Vec<tokio::sync::watch::Receiver<bool>>) {
         let (done, receiver) = tokio::sync::watch::channel(false);
         let mut loading = self.loading.lock().unwrap();
         let mut mine = Vec::new();
@@ -102,7 +102,7 @@ impl BulkInFlight {
     }
 }
 
-async fn wait_for_loads(waits: Vec<tokio::sync::watch::Receiver<bool>>) {
+pub(super) async fn wait_for_loads(waits: Vec<tokio::sync::watch::Receiver<bool>>) {
     for mut receiver in waits {
         // An error means the owner is gone, which is also a release.
         let _ = receiver.wait_for(|done| *done).await;
@@ -170,7 +170,7 @@ impl CacheKey for TermLengthKey {
 
 impl PostingListReader {
     /// The bulk path needs the compressed (v2) posting layout.
-    fn ensure_bulk_layout(&self) -> Result<()> {
+    pub(super) fn ensure_bulk_layout(&self) -> Result<()> {
         if self.is_legacy_layout() || !matches!(self.metadata, PostingMetadata::V2 { .. }) {
             return Err(Error::index("bulk posting reads need the v2 posting layout; rebuild the legacy index".to_string()));
         }
@@ -207,7 +207,7 @@ impl PostingListReader {
 
     /// Every token's document count, when resident (from [`Self::load_term_lengths`] or the full
     /// metadata).
-    fn known_lengths(&self) -> Option<&[u32]> {
+    pub(super) fn known_lengths(&self) -> Option<&[u32]> {
         self.resident_metadata().map(|resident| resident.lengths.as_slice()).or_else(|| self.term_lengths.get().map(Vec::as_slice))
     }
 
