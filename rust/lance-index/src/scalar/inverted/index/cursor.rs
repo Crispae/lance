@@ -10,6 +10,31 @@ use super::*;
 /// The doc id a cursor reports once it has run past the last document.
 pub const TERMINATED: u32 = u32::MAX;
 
+/// What a [`PostingCursor`] has decoded so far: deterministic counts, for callers that estimate or
+/// compare the cost of a plan without depending on timings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CursorWork {
+    /// Blocks of doc ids decoded (the first block counts, at opening).
+    pub doc_blocks: u64,
+    /// Blocks of frequencies decoded.
+    pub freq_blocks: u64,
+    /// Blocks of positions decoded.
+    pub position_blocks: u64,
+    /// [`PostingCursor::seek`] calls that had to look for a document (the cursor was before the
+    /// target).
+    pub seeks: u64,
+}
+
+impl CursorWork {
+    /// The sum of two counts.
+    pub fn add(&mut self, other: CursorWork) {
+        self.doc_blocks += other.doc_blocks;
+        self.freq_blocks += other.freq_blocks;
+        self.position_blocks += other.position_blocks;
+        self.seeks += other.seeks;
+    }
+}
+
 /// Walks the documents of one token's posting list in ascending doc-id order. Doc ids are local
 /// to the partition the list came from.
 ///
@@ -37,6 +62,7 @@ pub struct PostingCursor {
     positions: Vec<u32>,
     position_offsets: Vec<usize>,
     scratch: Vec<u32>,
+    work: CursorWork,
 }
 
 impl PostingCursor {
@@ -67,9 +93,15 @@ impl PostingCursor {
             positions: Vec::new(),
             position_offsets: Vec::new(),
             scratch,
+            work: CursorWork::default(),
         };
         cursor.load_block(0);
         Ok(cursor)
+    }
+
+    /// What this cursor has decoded and sought so far.
+    pub fn work(&self) -> CursorWork {
+        self.work
     }
 
     /// Number of documents in the list.
@@ -112,6 +144,7 @@ impl PostingCursor {
         if self.doc() >= target {
             return self.doc();
         }
+        self.work.seeks += 1;
         // The only block that can hold `target` is the last one starting at or before it.
         let first_docs = self.list.block_first_docs();
         let block = first_docs
@@ -154,6 +187,7 @@ impl PostingCursor {
             let Some(CompressedPositionStorage::SharedStream(stream)) = &self.list.positions else {
                 unreachable!("checked in new()")
             };
+            self.work.position_blocks += 1;
             self.positions.clear();
             super::super::encoding::decode_position_stream_block(
                 stream.block(self.block),
@@ -197,6 +231,7 @@ impl PostingCursor {
             self.block = self.num_blocks;
             return;
         }
+        self.work.doc_blocks += 1;
         let bytes = self.list.blocks.value(block);
         self.freq_offset = if self.is_tail_block(block) {
             super::super::encoding::decompress_posting_remainder_doc_ids(
@@ -220,6 +255,7 @@ impl PostingCursor {
         if self.freqs_ready {
             return;
         }
+        self.work.freq_blocks += 1;
         let bytes = self.list.blocks.value(self.block);
         self.freqs.clear();
         if self.is_tail_block(self.block) {

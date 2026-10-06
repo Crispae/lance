@@ -22,7 +22,7 @@ use lance_tokenizer::{BoxTokenStream, Token, TokenStream};
 use crate::metrics::NoOpMetricsCollector;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use crate::scalar::inverted::{
-    InvertedIndex, InvertedIndexBuilder, InvertedIndexParams, Language, PostingCursor, TERMINATED,
+    CursorWork, InvertedIndex, InvertedIndexBuilder, InvertedIndexParams, Language, PostingCursor, TERMINATED,
     register_tokenizer, unregister_tokenizer,
 };
 use crate::scalar::lance_format::LanceIndexStore;
@@ -294,6 +294,50 @@ async fn test_cursor_seek_agrees_with_a_model() {
         assert_eq!(cursor.advance(), TERMINATED);
         assert_eq!(cursor.seek(0), TERMINATED);
     }
+    assert!(unregister_tokenizer(name));
+}
+
+#[tokio::test]
+async fn test_cursor_counts_the_blocks_it_decodes() {
+    const NUM_DOCS: usize = 1_000;
+    let name = "rustie-test/slots-work";
+    let index = build_index(name, NUM_DOCS, true).await;
+    let metrics = NoOpMetricsCollector;
+    let partition = &index.partitions()[0];
+    let token_id = partition.token_id("common").unwrap();
+
+    // Walking a whole list decodes each doc-id block once, and nothing else without being asked.
+    let mut cursor = partition.posting_cursor(token_id, true, &metrics).await.unwrap();
+    let len = cursor.len();
+    assert_eq!(cursor.work(), CursorWork { doc_blocks: 1, ..Default::default() }, "opening decodes block 0");
+    while cursor.advance() != TERMINATED {}
+    let blocks = len.div_ceil(128) as u64;
+    assert!(blocks >= 7, "the list must span several blocks: {len} documents");
+    assert_eq!(cursor.work(), CursorWork { doc_blocks: blocks, ..Default::default() });
+
+    // Frequencies and positions are decoded a block at a time, only when asked for.
+    let mut cursor = partition.posting_cursor(token_id, true, &metrics).await.unwrap();
+    let mut positions = Vec::new();
+    while cursor.doc() != TERMINATED {
+        cursor.positions(&mut positions).unwrap();
+        cursor.advance();
+    }
+    assert_eq!(
+        cursor.work(),
+        CursorWork { doc_blocks: blocks, freq_blocks: blocks, position_blocks: blocks, seeks: 0 },
+        "one of each per block, however many documents are read"
+    );
+
+    // A seek counts only when the cursor was before the target, and it skips the blocks between.
+    let mut cursor = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+    let first = cursor.doc();
+    cursor.seek(first); // already there: no work
+    assert_eq!(cursor.work().seeks, 0);
+    let far = cursor.seek(first + 700);
+    assert_ne!(far, TERMINATED);
+    let work = cursor.work();
+    assert_eq!(work.seeks, 1);
+    assert!(work.doc_blocks < blocks, "the seek jumped over blocks: {work:?}");
     assert!(unregister_tokenizer(name));
 }
 
