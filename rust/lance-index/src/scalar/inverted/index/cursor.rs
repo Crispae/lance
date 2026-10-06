@@ -145,6 +145,12 @@ impl PostingCursor {
             return self.doc();
         }
         self.work.seeks += 1;
+        // A target inside the block the cursor is in (the usual case on a dense list) needs no
+        // search among the block heads: the next block starts above this block's last document.
+        if self.doc_ids.last().is_some_and(|&last| last >= target) {
+            self.pos += self.doc_ids[self.pos..].partition_point(|&doc| doc < target);
+            return self.doc();
+        }
         // The only block that can hold `target` is the last one starting at or before it.
         let first_docs = self.list.block_first_docs();
         let block = first_docs
