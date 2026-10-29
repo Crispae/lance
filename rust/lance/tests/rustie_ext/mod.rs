@@ -87,12 +87,48 @@ impl LanceTokenizer for SlotTokenizer {
     fn doc_type(&self) -> DocType {
         DocType::Text
     }
+
+    /// The number of slots, gaps included: not the number of terms.
+    fn doc_length(&self, text: &str) -> Option<u32> {
+        Some(text.split_whitespace().count() as u32)
+    }
 }
 
-/// `common` at positions 0 and 3, a document-specific term at 0, `third` at 1 for every third id.
+/// `common` at positions 0 and 3, a document-specific term at 0, `third` at 1 for every third id, and
+/// `id % 4` trailing empty slots: the document's length is `4 + id % 4` whatever its terms.
 fn slots_of(id: i32) -> String {
     let third = if id % 3 == 0 { "third" } else { "_" };
-    format!("common,d{} {third} _ common", id % 5)
+    format!("common,d{} {third} _ common{}", id % 5, " _".repeat((id % 4) as usize))
+}
+
+/// The length the index records for each row (`row id -> length`) over every partition of every
+/// segment of the index.
+async fn recorded_lengths(ds: &Dataset) -> BTreeMap<u64, u32> {
+    let mut out = BTreeMap::new();
+    let metrics = NoOpMetricsCollector;
+    for segment in ds.load_indices_by_name("slots_idx").await.unwrap() {
+        let index = ds.open_scalar_index("slots", &segment.uuid, &metrics).await.unwrap();
+        let index = index.as_any().downcast_ref::<InvertedIndex>().expect("an FTS index");
+        for partition in index.partitions() {
+            let rows = partition.rows().await.unwrap();
+            for doc in 0..rows.len() as u32 {
+                if let Some(row) = rows.row_id(doc) {
+                    assert!(out.insert(row, rows.doc_length(doc)).is_none(), "row {row} indexed twice");
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every live row of the table has, in the index, the length its slots give.
+async fn assert_lengths_follow_the_table(ds: &Dataset, when: &str) {
+    let recorded = recorded_lengths(ds).await;
+    let rows = live_rows(ds).await;
+    assert!(!rows.is_empty());
+    for (row, id) in rows {
+        assert_eq!(recorded.get(&row), Some(&(4 + (id % 4) as u32)), "{when}: length of row {row} (id {id})");
+    }
 }
 
 fn batch(ids: std::ops::Range<i32>) -> RecordBatch {
@@ -181,6 +217,7 @@ async fn test_extension_index_follows_stable_row_ids_across_append_delete_and_co
     let thirds: BTreeSet<u64> = rows.iter().filter(|(_, id)| *id % 3 == 0).map(|(row, _)| *row).collect();
     assert_eq!(third.keys().copied().collect::<BTreeSet<_>>(), thirds);
     assert!(third.values().all(|positions| positions == &[1]));
+    assert_lengths_follow_the_table(&ds, "created").await;
 
     // An append is a new fragment the index does not cover until optimize adds a segment.
     let more = batch(900..1200);
@@ -192,6 +229,7 @@ async fn test_extension_index_follows_stable_row_ids_across_append_delete_and_co
     assert_eq!(rows.len(), 1200);
     let common = token_postings(&ds, "common").await;
     assert_eq!(common.keys().copied().collect::<BTreeSet<_>>(), rows.keys().copied().collect::<BTreeSet<_>>());
+    assert_lengths_follow_the_table(&ds, "appended and optimized").await;
 
     // Deleted rows stay in the index (the dataset's deletion mask applies at query time); compaction
     // rewrites fragments, and with stable row ids the surviving rows keep their ids.
@@ -209,6 +247,7 @@ async fn test_extension_index_follows_stable_row_ids_across_append_delete_and_co
     let indexed: BTreeSet<u64> = common.keys().copied().collect();
     assert!(live.is_subset(&indexed), "every live row is still indexed under its row id");
     assert!(common.values().all(|positions| positions == &[0, 3]));
+    assert_lengths_follow_the_table(&ds, "deleted and compacted").await;
 
     // Row ids from the index fetch the right rows: the stored text tokenizes to what the index holds.
     let sample: Vec<u64> = live.iter().copied().step_by(97).collect();

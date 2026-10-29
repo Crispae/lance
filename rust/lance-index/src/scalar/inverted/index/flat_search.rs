@@ -305,6 +305,7 @@ pub(super) async fn tokenize_and_count(
                     for positions in &mut temp_query_positions {
                         positions.clear();
                     }
+                    let reported_length = tokenizer.doc_length(doc);
                     let mut stream = tokenizer.token_stream_for_doc(doc);
                     let mut all_tokens = 0;
                     while let Some(token) = stream.next() {
@@ -332,7 +333,8 @@ pub(super) async fn tokenize_and_count(
                             slop,
                         )
                     });
-                    Ok((all_tokens, matches))
+                    // The index records the tokenizer's length when it reports one.
+                    Ok((reported_length.map_or(all_tokens, u64::from), matches))
                 };
                 let mut append_counts = |row_index: usize,
                                          row_id: u64,
@@ -704,6 +706,7 @@ fn count_column_into(
     let mut record = |row: usize, doc: &str| {
         let slot = row * num_columns + column_slot;
         let base = slot * num_terms;
+        let reported_length = tokenizer.doc_length(doc);
         let mut stream = tokenizer.token_stream_for_doc(doc);
         while let Some(token) = stream.next() {
             all_tokens[slot] += 1;
@@ -712,6 +715,10 @@ fn count_column_into(
                     counts[base + *token_index] += 1;
                 }
             }
+        }
+        // The index records the tokenizer's length when it reports one.
+        if let Some(length) = reported_length {
+            all_tokens[slot] = u64::from(length);
         }
     };
     match doc_col.data_type() {

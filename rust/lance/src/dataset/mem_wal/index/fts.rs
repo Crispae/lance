@@ -2955,6 +2955,8 @@ fn index_text_with_predicate(
     term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
     mut retain_term: impl FnMut(&str) -> bool,
 ) -> Result<(u32, bool)> {
+    // The length the index records: the tokenizer's, when it reports one, else the token count.
+    let reported_length = tokenizer.doc_length(text);
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut num_tokens = 0u32;
     let mut retained_term = false;
@@ -2983,7 +2985,7 @@ fn index_text_with_predicate(
             ))
         })?;
     }
-    Ok((num_tokens, retained_term))
+    Ok((reported_length.unwrap_or(num_tokens), retained_term))
 }
 
 fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {

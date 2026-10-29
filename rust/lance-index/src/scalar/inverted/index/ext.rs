@@ -37,6 +37,19 @@ impl PartitionRows {
         let row = self.0.row_address(doc_id);
         (row != RowAddress::TOMBSTONE_ROW).then_some(row)
     }
+
+    /// The length the index recorded for `doc_id`: what the tokenizer reported through
+    /// `LanceTokenizer::doc_length`, else its number of tokens (P12). Resident, so no read.
+    #[inline]
+    pub fn doc_length(&self, doc_id: u32) -> u32 {
+        self.0.doc_length(doc_id)
+    }
+
+    /// Whether every document has a row id and the row ids strictly ascend with the doc id, so the
+    /// partition's rows are one run in document order (memoized when the partition's rows load).
+    pub fn dense_and_strictly_ascending(&self) -> bool {
+        self.0.dense_and_strictly_ascending()
+    }
 }
 
 impl InvertedPartition {

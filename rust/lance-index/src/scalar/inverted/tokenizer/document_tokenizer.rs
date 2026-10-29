@@ -79,6 +79,13 @@ pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     fn box_clone(&self) -> Box<dyn LanceTokenizer>;
     /// Get document type.
     fn doc_type(&self) -> DocType;
+    /// The length the index records for `text` (BM25 norms, impacts, average length) when it is not
+    /// the number of tokens [`Self::token_stream_for_doc`] emits: a tokenizer that stacks several
+    /// terms on one position, or encodes other data in positions. `None` (the default): the token
+    /// count. A document with no token but a length above 0 is kept in the index.
+    fn doc_length(&self, _text: &str) -> Option<u32> {
+        None
+    }
 }
 
 impl Clone for Box<dyn LanceTokenizer> {

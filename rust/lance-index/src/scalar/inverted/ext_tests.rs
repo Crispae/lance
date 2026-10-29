@@ -5,7 +5,7 @@
 //! index built and reloaded with it, and the partition / cursor / row-id accessors read back
 //! against a model of what was indexed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, UInt64Array};
@@ -683,5 +683,180 @@ async fn test_sidecar_cursors_equal_posting_file_cursors() {
         reads.push(object_store.io_stats_incremental().read_iops);
     }
     assert!(reads[1] < reads[0], "positional reads of {} scattered tokens: side file {}, posting file {}", rest.len(), reads[1], reads[0]);
+    assert!(unregister_tokenizer(name));
+}
+
+/// A [`SlotTokenizer`] that reports the number of slots, gaps included, as the document's length.
+#[derive(Debug, Clone)]
+struct SlotLengthTokenizer;
+
+impl LanceTokenizer for SlotLengthTokenizer {
+    fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a> {
+        SlotTokenizer::stream(query_text)
+    }
+
+    fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
+        SlotTokenizer::stream(text)
+    }
+
+    fn box_clone(&self) -> Box<dyn LanceTokenizer> {
+        Box::new(self.clone())
+    }
+
+    fn doc_type(&self) -> DocType {
+        DocType::Text
+    }
+
+    fn doc_length(&self, text: &str) -> Option<u32> {
+        Some(text.split_whitespace().count() as u32)
+    }
+}
+
+/// A batch of `docs`, document `first + k` having row `ROW_BASE + first + k`.
+fn batch_of(docs: &[String], first: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slots", DataType::Utf8, true),
+        Field::new(ROW_ID, DataType::UInt64, false),
+    ]));
+    let rows: Vec<u64> = (first..first + docs.len())
+        .map(|i| ROW_BASE + i as u64)
+        .collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(docs.to_vec())),
+            Arc::new(UInt64Array::from(rows)),
+        ],
+    )
+    .unwrap()
+}
+
+/// An index of `batches` (in this order) built with the tokenizer `name`.
+async fn build_index_of(
+    name: &str,
+    batches: Vec<RecordBatch>,
+    cache: &LanceCache,
+) -> Arc<InvertedIndex> {
+    let dir = TempDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::local()),
+        dir.obj_path(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::new(name.to_string(), Language::English).with_position(true);
+    let schema = batches[0].schema();
+    let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
+    InvertedIndexBuilder::new(params)
+        .update(Box::pin(stream), store.as_ref(), None)
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    InvertedIndex::load(store, None, cache).await.unwrap()
+}
+
+/// The index records the length the tokenizer reports, not the number of tokens it emits (P12), keeps a
+/// document that has a length but no token, and omits one that has neither; without the hook the
+/// length is the token count. The partition says whether its rows ascend (P13).
+#[tokio::test]
+async fn test_documents_record_the_length_their_tokenizer_reports() {
+    const NUM_DOCS: usize = 700;
+    let cache = LanceCache::no_cache();
+    let name = "rustie-test/slots-reported-length";
+    register_tokenizer(
+        name,
+        Arc::new(|_| Ok(Box::new(SlotLengthTokenizer) as Box<dyn LanceTokenizer>)),
+    )
+    .unwrap();
+    // Trailing gaps give a document slots that hold no token.
+    let mut docs: Vec<String> = (0..NUM_DOCS)
+        .map(|i| format!("{}{}", document(i).0, " _".repeat(i % 4)))
+        .collect();
+    docs.push("_ _ _".to_string()); // no token, a length of 3: kept
+    docs.push("   ".to_string()); // no token, no length: omitted
+    let reported = |text: &str| text.split_whitespace().count() as u32;
+    let batches = docs
+        .chunks(400)
+        .enumerate()
+        .map(|(k, chunk)| batch_of(chunk, k * 400))
+        .collect();
+    let index = build_index_of(name, batches, &cache).await;
+
+    let (mut seen, mut differs) = (BTreeSet::new(), 0);
+    for partition in index.partitions() {
+        let rows = partition.rows().await.unwrap();
+        for doc in 0..rows.len() as u32 {
+            let row = rows.row_id(doc).expect("no dead slots here");
+            let i = (row - ROW_BASE) as usize;
+            assert_eq!(
+                rows.doc_length(doc),
+                reported(&docs[i]),
+                "length of document {i}"
+            );
+            differs +=
+                usize::from(i < NUM_DOCS && rows.doc_length(doc) as usize != document(i).1.len());
+            seen.insert(i);
+        }
+        assert!(
+            rows.dense_and_strictly_ascending(),
+            "batches in row order give one ascending run"
+        );
+    }
+    assert_eq!(
+        seen,
+        (0..=NUM_DOCS).collect::<BTreeSet<_>>(),
+        "every document but the blank one is indexed"
+    );
+    assert!(
+        differs > NUM_DOCS / 2,
+        "the reported length must differ from the token count for most documents: {differs}"
+    );
+    assert!(unregister_tokenizer(name));
+
+    // Batches out of row order: documents are numbered in arrival order, so the rows do not ascend.
+    let name = "rustie-test/slots-reported-length-descending";
+    register_tokenizer(
+        name,
+        Arc::new(|_| Ok(Box::new(SlotLengthTokenizer) as Box<dyn LanceTokenizer>)),
+    )
+    .unwrap();
+    let batches = vec![batch_of(&docs[400..600], 400), batch_of(&docs[0..400], 0)];
+    let index = build_index_of(name, batches, &cache).await;
+    for partition in index.partitions() {
+        let rows = partition.rows().await.unwrap();
+        let ascending = (1..rows.len() as u32).all(|doc| rows.row_id(doc - 1) < rows.row_id(doc));
+        assert!(!ascending && !rows.dense_and_strictly_ascending());
+    }
+    assert!(unregister_tokenizer(name));
+
+    // Without the hook the length is the token count, and a document with no token is omitted.
+    let name = "rustie-test/slots-token-count-length";
+    register_tokenizer(
+        name,
+        Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>)),
+    )
+    .unwrap();
+    let mut docs: Vec<String> = (0..NUM_DOCS).map(|i| document(i).0).collect();
+    docs.push("_ _ _".to_string());
+    let batches = docs
+        .chunks(400)
+        .enumerate()
+        .map(|(k, chunk)| batch_of(chunk, k * 400))
+        .collect();
+    let index = build_index_of(name, batches, &cache).await;
+    let mut count = 0;
+    for partition in index.partitions() {
+        let rows = partition.rows().await.unwrap();
+        for doc in 0..rows.len() as u32 {
+            let i = (rows.row_id(doc).unwrap() - ROW_BASE) as usize;
+            assert!(i < NUM_DOCS, "the document with no token is omitted");
+            assert_eq!(
+                rows.doc_length(doc) as usize,
+                document(i).1.len(),
+                "length of document {i}"
+            );
+            count += 1;
+        }
+    }
+    assert_eq!(count, NUM_DOCS);
     assert!(unregister_tokenizer(name));
 }

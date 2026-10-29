@@ -1621,6 +1621,8 @@ impl IndexWorker {
         let old_token_memory_size = self.builder.tokens.memory_size() as u64;
         let doc_id = self.builder.docs.len() as u32;
         let mut token_num: u32 = 0;
+        // The length the tokenizer reports for the document, when it is not `token_num`.
+        let mut reported_length: Option<u32> = None;
         let mut doc_length_bytes = 0usize;
         let mut posting_memory_delta = 0i64;
         if with_position {
@@ -1639,6 +1641,7 @@ impl IndexWorker {
                 let block_size = builder.block_size;
                 let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
+                    reported_length = tokenizer.doc_length(text);
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
                     while token_stream.advance() {
                         let token = token_stream.token();
@@ -1700,6 +1703,7 @@ impl IndexWorker {
                 let token_ids = &mut self.token_ids;
                 let mut process_text = |text: &str| {
                     doc_length_bytes += text.len();
+                    reported_length = tokenizer.doc_length(text);
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
                     while token_stream.advance() {
                         let token_id = builder.tokens.get_or_add(&token_stream.token().text);
@@ -1722,10 +1726,13 @@ impl IndexWorker {
             self.builder.tokens.memory_size() as u64,
         );
 
-        // Row indexes omit zero-token documents from corpus statistics.
-        // ListElement indexes retain them so their physical coordinates remain
-        // part of the document corpus even when they cannot match a term.
-        if token_num == 0 && self.coordinate_rank == 0 {
+        // The length the index records: the tokenizer's, else the token count.
+        let doc_length = reported_length.unwrap_or(token_num);
+        // Row indexes omit zero-token documents from corpus statistics, unless
+        // the tokenizer gave them a length. ListElement indexes retain them so
+        // their physical coordinates remain part of the document corpus even
+        // when they cannot match a term.
+        if token_num == 0 && doc_length == 0 && self.coordinate_rank == 0 {
             self.last_token_count = 0;
             self.trim_temporary_buffers();
             self.adjust_tracked_memory_size(
@@ -1756,11 +1763,11 @@ impl IndexWorker {
 
         let old_doc_memory_size = self.builder.docs.memory_size() as u64;
         let appended_doc_id = if doc_index.is_empty() {
-            self.builder.docs.append(row_id, token_num)
+            self.builder.docs.append(row_id, doc_length)
         } else {
             self.builder
                 .docs
-                .append_with_doc_index(row_id, token_num, doc_index)?
+                .append_with_doc_index(row_id, doc_length, doc_index)?
         };
         debug_assert_eq!(appended_doc_id, doc_id);
         self.adjust_tracked_memory_size(

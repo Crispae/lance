@@ -1343,6 +1343,28 @@ impl AddressKeyedDocuments {
         }
     }
 
+    /// The length the index recorded for `doc_id`: the tokenizer's (`LanceTokenizer::doc_length`) or
+    /// its token count.
+    #[inline]
+    pub(crate) fn doc_length(&self, doc_id: u32) -> u32 {
+        match &self.0 {
+            AddressKeyedSource::Legacy(docs) => docs.num_tokens(doc_id),
+            AddressKeyedSource::Modern { lengths, .. } => lengths.exact(DocId::new(doc_id)),
+        }
+    }
+
+    /// Whether every document has a row address and the addresses strictly ascend with the DocId.
+    /// Always `false` for a legacy partition.
+    #[inline]
+    pub(crate) fn dense_and_strictly_ascending(&self) -> bool {
+        match &self.0 {
+            AddressKeyedSource::Legacy(_) => false,
+            AddressKeyedSource::Modern {
+                strictly_ascending, ..
+            } => *strictly_ascending,
+        }
+    }
+
     /// Total length of the row at `address`: the sum over every document the row
     /// owns in this partition, or 0 when the partition holds none (an empty or
     /// null field, a row outside the partition, or a dead slot).
@@ -2148,8 +2170,7 @@ impl PartitionDocuments {
                 .read_range(0..self.num_docs, Some(&[ROW_ID, NUM_TOKEN_COL]))
                 .await?;
             let lengths = self.lengths_from_batch(&batch)?;
-            let row_ids =
-                Arc::new(required_u64_column(&batch, ROW_ID, &self.path)?.clone());
+            let row_ids = Arc::new(required_u64_column(&batch, ROW_ID, &self.path)?.clone());
             if row_ids.null_count() != 0 {
                 return Err(corrupt_docs(
                     &self.path,
