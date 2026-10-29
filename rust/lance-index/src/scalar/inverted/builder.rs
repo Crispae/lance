@@ -181,6 +181,13 @@ fn group_tail_builders(
 }
 
 fn merge_tail_group(group: Vec<InnerBuilder>) -> Result<InnerBuilder> {
+    // Every worker takes batches from one shared channel, so each holds its
+    // documents in row order while the workers' row ranges interleave.
+    // Merging them by row id keeps the merged partition in row order, one
+    // run; concatenating them, the fallback, starts a new run at every builder.
+    if let Some(order) = row_order_merge(&group) {
+        return InnerBuilder::merge_in_row_order(group, &order);
+    }
     let mut builders = group.into_iter();
     let mut merged = builders
         .next()
@@ -189,6 +196,47 @@ fn merge_tail_group(group: Vec<InnerBuilder>) -> Result<InnerBuilder> {
         merged.merge_from(builder)?;
     }
     Ok(merged)
+}
+
+/// The order of a merge of `group` by row id: `(builder, document)` pairs by
+/// ascending row id. `None` when such a merge would not give each row one
+/// document in order: fewer than two builders, list-element documents (several
+/// per row), a builder whose row ids do not strictly ascend, or a row in two
+/// builders.
+fn row_order_merge(group: &[InnerBuilder]) -> Option<Vec<(usize, u32)>> {
+    if group.len() < 2 {
+        return None;
+    }
+    for builder in group {
+        let docs = &builder.docs;
+        // Checked here rather than with `DocSet::row_ids_strictly_ascending`,
+        // which memoizes its answer: the fallback appends to the first builder.
+        if docs.coordinate_rank() > 0
+            || !docs.has_row_ids()
+            || !(1..docs.len() as u32).all(|doc| docs.row_id(doc - 1) < docs.row_id(doc))
+        {
+            return None;
+        }
+    }
+    let total = group.iter().map(|builder| builder.docs.len()).sum();
+    let mut next = vec![0u32; group.len()];
+    let mut order = Vec::with_capacity(total);
+    let mut last_row = None;
+    for _ in 0..total {
+        let (input, row) = group
+            .iter()
+            .enumerate()
+            .filter(|(input, builder)| (next[*input] as usize) < builder.docs.len())
+            .map(|(input, builder)| (input, builder.docs.row_id(next[input])))
+            .min_by_key(|(_, row)| *row)?;
+        if last_row.is_some_and(|last| last >= row) {
+            return None;
+        }
+        last_row = Some(row);
+        order.push((input, next[input]));
+        next[input] += 1;
+    }
+    Some(order)
 }
 
 #[derive(Debug)]
@@ -1056,49 +1104,141 @@ impl InnerBuilder {
         self.remap(&RowAddrRemap::direct(mapping)).await
     }
 
+    /// Merges `group` into its first builder with the documents renumbered in
+    /// `order` (see [`row_order_merge`]). The renumbering keeps each builder's
+    /// documents in their order, so every merged posting list is a k-way merge
+    /// of lists that are already sorted.
+    fn merge_in_row_order(mut group: Vec<Self>, order: &[(usize, u32)]) -> Result<Self> {
+        for other in &group[1..] {
+            group[0].check_mergeable(other)?;
+        }
+        let (with_position, posting_tail_codec, block_size) = (
+            group[0].with_position,
+            group[0].posting_tail_codec,
+            group[0].block_size,
+        );
+
+        let mut new_doc: Vec<Vec<u32>> = group
+            .iter()
+            .map(|builder| vec![0; builder.docs.len()])
+            .collect();
+        let mut docs = DocSet::default();
+        for &(input, doc) in order {
+            let from = &group[input].docs;
+            new_doc[input][doc as usize] = docs.append(from.row_id(doc), from.num_tokens(doc));
+        }
+
+        // The first builder's dictionary takes every other builder's tokens.
+        let mut sources: Vec<SmallVec<[(usize, u32); 4]>> = Vec::new();
+        {
+            let (first, rest) = group.split_first_mut().expect("at least two builders");
+            let mut maps: Vec<Vec<u32>> = vec![(0..first.posting_lists.len() as u32).collect()];
+            for other in rest.iter() {
+                let mut map = vec![u32::MAX; other.posting_lists.len()];
+                for (token_id, token) in other.tokens.iter() {
+                    map[token_id as usize] = first.tokens.get_or_add(token);
+                }
+                maps.push(map);
+            }
+            sources.resize_with(first.tokens.len(), SmallVec::new);
+            for (input, map) in maps.iter().enumerate() {
+                for (local, &merged) in map.iter().enumerate() {
+                    if merged != u32::MAX {
+                        sources[merged as usize].push((input, local as u32));
+                    }
+                }
+            }
+        }
+
+        let mut posting_lists = Vec::with_capacity(sources.len());
+        for sources in sources {
+            let mut merged = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                with_position,
+                posting_tail_codec,
+                block_size,
+            );
+            let mut runs = Vec::with_capacity(sources.len());
+            for (input, local) in sources {
+                // Taken out of its builder, so each list is freed once merged.
+                let list = std::mem::replace(
+                    &mut group[input].posting_lists[local as usize],
+                    PostingListBuilder::new(false),
+                );
+                let mut entries = Vec::with_capacity(list.len());
+                list.for_each_entry(|doc_id, freq, positions| {
+                    entries.push((new_doc[input][doc_id as usize], freq, positions));
+                    Ok::<(), Error>(())
+                })?;
+                runs.push(entries.into_iter().peekable());
+            }
+            while let Some(run) = (0..runs.len())
+                .filter_map(|run| runs[run].peek().map(|(doc_id, ..)| (run, *doc_id)))
+                .min_by_key(|(_, doc_id)| *doc_id)
+                .map(|(run, _)| run)
+            {
+                let (doc_id, freq, positions) = runs[run].next().expect("peeked");
+                let positions = match positions {
+                    Some(positions) => PositionRecorder::Position(positions.into()),
+                    None => PositionRecorder::Count(freq),
+                };
+                merged.add(doc_id, positions);
+            }
+            posting_lists.push(merged);
+        }
+
+        let mut merged = group.swap_remove(0);
+        merged.docs = docs;
+        merged.posting_lists = posting_lists;
+        Ok(merged)
+    }
+
+    fn check_mergeable(&self, other: &Self) -> Result<()> {
+        if self.with_position != other.with_position {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched positions settings: {} vs {}",
+                self.with_position, other.with_position
+            )));
+        }
+        if self.token_set_format != other.token_set_format {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched token set formats: {:?} vs {:?}",
+                self.token_set_format, other.token_set_format
+            )));
+        }
+        if self.format_version != other.format_version {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched FTS format versions: {:?} vs {:?}",
+                self.format_version, other.format_version
+            )));
+        }
+        if self.posting_tail_codec != other.posting_tail_codec {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched posting tail codecs: {:?} vs {:?}",
+                self.posting_tail_codec, other.posting_tail_codec
+            )));
+        }
+        if self.block_size != other.block_size {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched FTS block sizes: {} vs {}",
+                self.block_size, other.block_size
+            )));
+        }
+        Ok(())
+    }
+
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        self.check_mergeable(&other)?;
         let Self {
             id: _,
             with_position,
-            token_set_format,
-            format_version,
-            posting_tail_codec,
-            block_size,
+            token_set_format: _,
+            format_version: _,
+            posting_tail_codec: _,
+            block_size: _,
             tokens,
             posting_lists,
             docs,
         } = other;
-
-        if self.with_position != with_position {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched positions settings: {} vs {}",
-                self.with_position, with_position
-            )));
-        }
-        if self.token_set_format != token_set_format {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched token set formats: {:?} vs {:?}",
-                self.token_set_format, token_set_format
-            )));
-        }
-        if self.format_version != format_version {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched FTS format versions: {:?} vs {:?}",
-                self.format_version, format_version
-            )));
-        }
-        if self.posting_tail_codec != posting_tail_codec {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched posting tail codecs: {:?} vs {:?}",
-                self.posting_tail_codec, posting_tail_codec
-            )));
-        }
-        if self.block_size != block_size {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched FTS block sizes: {} vs {}",
-                self.block_size, block_size
-            )));
-        }
 
         let mut token_id_map = vec![u32::MAX; posting_lists.len()];
         for (token_id, token) in tokens.iter() {
@@ -4892,6 +5032,123 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    /// A worker's builder, with positions, holding `rows` in this order: every
+    /// document has `common` at positions 0 and `row % 5 + 1`, its builder's own
+    /// term at 2, and `rare` at 1 when the row is a multiple of 4.
+    fn worker_with_rows(id: u64, rows: &[u64]) -> InnerBuilder {
+        let mut builder = InnerBuilder::new(id, true, TokenSetFormat::default());
+        for &row in rows {
+            let doc = builder.docs.append(row, 3 + (row % 7) as u32);
+            let mut terms = vec![
+                ("common".to_string(), vec![0, (row % 5) as u32 + 1]),
+                (format!("own{id}"), vec![2]),
+            ];
+            if row % 4 == 0 {
+                terms.push(("rare".to_string(), vec![1]));
+            }
+            for (term, positions) in terms {
+                let token = builder.tokens.get_or_add(&term);
+                builder
+                    .posting_lists
+                    .resize_with(builder.tokens.len(), || PostingListBuilder::new(true));
+                builder.posting_lists[token as usize]
+                    .add(doc, PositionRecorder::Position(positions.into()));
+            }
+        }
+        builder
+    }
+
+    /// Every term's postings as `(row, frequency, positions)` in document order,
+    /// and every row's length: what a merge must keep whatever the document numbers.
+    type Contents = (
+        std::collections::BTreeMap<String, Vec<(u64, u32, Option<Vec<u32>>)>>,
+        std::collections::BTreeMap<u64, u32>,
+    );
+
+    fn contents(builder: &InnerBuilder) -> Contents {
+        let mut postings = std::collections::BTreeMap::new();
+        for (token_id, token) in builder.tokens.iter() {
+            let mut entries = Vec::new();
+            let mut last_doc = None;
+            builder.posting_lists[token_id as usize]
+                .for_each_entry(|doc_id, freq, positions| {
+                    assert!(
+                        last_doc.is_none_or(|last| last < doc_id),
+                        "{token}: documents ascend"
+                    );
+                    last_doc = Some(doc_id);
+                    entries.push((builder.docs.row_id(doc_id), freq, positions));
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+            entries.sort_by_key(|(row, ..)| *row);
+            postings.insert(token.to_string(), entries);
+        }
+        let lengths = (0..builder.docs.len() as u32)
+            .map(|doc| (builder.docs.row_id(doc), builder.docs.num_tokens(doc)))
+            .collect();
+        (postings, lengths)
+    }
+
+    #[test]
+    fn test_tail_group_merges_interleaved_workers_in_row_order() {
+        // Three workers that took turns at the shared channel: their rows interleave.
+        let rows = |worker: u64| {
+            (0..300u64)
+                .filter(|row| row % 3 == worker)
+                .collect::<Vec<_>>()
+        };
+        let workers = || {
+            (0..3)
+                .map(|worker| worker_with_rows(worker, &rows(worker)))
+                .collect::<Vec<_>>()
+        };
+        let merged = merge_tail_group(workers()).unwrap();
+        assert_eq!(merged.id(), 0);
+        let merged_rows: Vec<u64> = (0..merged.docs.len() as u32)
+            .map(|doc| merged.docs.row_id(doc))
+            .collect();
+        assert_eq!(
+            merged_rows,
+            (0..300).collect::<Vec<_>>(),
+            "one run, in row order"
+        );
+
+        // The same postings, positions and lengths as concatenating the builders.
+        let mut concatenated = workers().into_iter();
+        let mut first = concatenated.next().unwrap();
+        for other in concatenated {
+            first.merge_from(other).unwrap();
+        }
+        assert_eq!(contents(&merged), contents(&first));
+        assert_eq!(
+            merged.tokens.len(),
+            5,
+            "common, rare and one term per worker"
+        );
+    }
+
+    #[test]
+    fn test_tail_group_concatenates_when_rows_cannot_be_merged_in_order() {
+        // A builder whose rows do not ascend, and a row held by two builders: the
+        // documents keep their builders' order, as before.
+        for groups in [
+            vec![vec![5, 1, 9], vec![2, 3]],
+            vec![vec![1, 4], vec![4, 6]],
+        ] {
+            let group = groups
+                .iter()
+                .enumerate()
+                .map(|(worker, rows)| worker_with_rows(worker as u64, rows))
+                .collect();
+            let merged = merge_tail_group(group).unwrap();
+            let rows: Vec<u64> = (0..merged.docs.len() as u32)
+                .map(|doc| merged.docs.row_id(doc))
+                .collect();
+            assert_eq!(rows, groups.concat());
+        }
     }
 
     #[test]

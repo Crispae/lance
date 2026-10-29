@@ -737,13 +737,27 @@ async fn build_index_of(
     batches: Vec<RecordBatch>,
     cache: &LanceCache,
 ) -> Arc<InvertedIndex> {
+    build_index_with_workers(name, batches, None, cache).await
+}
+
+/// [`build_index_of`] with `workers` index workers (`None`: the default).
+async fn build_index_with_workers(
+    name: &str,
+    batches: Vec<RecordBatch>,
+    workers: Option<usize>,
+    cache: &LanceCache,
+) -> Arc<InvertedIndex> {
     let dir = TempDir::default();
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(ObjectStore::local()),
         dir.obj_path(),
         Arc::new(LanceCache::no_cache()),
     ));
-    let params = InvertedIndexParams::new(name.to_string(), Language::English).with_position(true);
+    let mut params =
+        InvertedIndexParams::new(name.to_string(), Language::English).with_position(true);
+    if let Some(workers) = workers {
+        params = params.num_workers(workers);
+    }
     let schema = batches[0].schema();
     let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
     InvertedIndexBuilder::new(params)
@@ -858,5 +872,57 @@ async fn test_documents_record_the_length_their_tokenizer_reports() {
         }
     }
     assert_eq!(count, NUM_DOCS);
+    assert!(unregister_tokenizer(name));
+}
+
+/// Parallel index workers take batches in turn, so their rows interleave; the partitions they leave
+/// are merged by row id (P14), so each is one run in row order, and holds what was indexed. The
+/// workers need threads of their own to interleave, as they have in an ingest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_parallel_workers_leave_partitions_in_row_order() {
+    const NUM_DOCS: usize = 3_000;
+    let cache = LanceCache::no_cache();
+    let name = "rustie-test/slots-workers";
+    register_tokenizer(
+        name,
+        Arc::new(|_| Ok(Box::new(SlotTokenizer) as Box<dyn LanceTokenizer>)),
+    )
+    .unwrap();
+    let docs: Vec<String> = (0..NUM_DOCS).map(|i| document(i).0).collect();
+    let batches = docs
+        .chunks(25)
+        .enumerate()
+        .map(|(k, chunk)| batch_of(chunk, k * 25))
+        .collect();
+    let index = build_index_with_workers(name, batches, Some(4), &cache).await;
+    let expected = model(NUM_DOCS);
+    let metrics = NoOpMetricsCollector;
+    let mut found: BTreeMap<String, Vec<(usize, Vec<u32>)>> = BTreeMap::new();
+    for partition in index.partitions() {
+        let rows = partition.rows().await.unwrap();
+        let ascending = (1..rows.len() as u32).all(|doc| rows.row_id(doc - 1) < rows.row_id(doc));
+        assert!(
+            ascending && rows.dense_and_strictly_ascending(),
+            "a partition of {} documents is not one run",
+            rows.len()
+        );
+        for term in expected.keys() {
+            let Some(token_id) = partition.token_id(term) else {
+                continue;
+            };
+            let mut cursor = partition
+                .posting_cursor(token_id, true, &metrics)
+                .await
+                .unwrap();
+            for (doc, _, positions) in drain(&mut cursor, true) {
+                let i = (rows.row_id(doc).unwrap() - ROW_BASE) as usize;
+                found.entry(term.clone()).or_default().push((i, positions));
+            }
+        }
+    }
+    for entries in found.values_mut() {
+        entries.sort();
+    }
+    assert_eq!(found, expected, "the postings of every term");
     assert!(unregister_tokenizer(name));
 }
