@@ -35,6 +35,24 @@ impl CursorWork {
     }
 }
 
+/// The rest of a cursor's current block with its documents' positions
+/// ([`PostingCursor::current_block_positions`]): `docs[i]`'s positions are
+/// `positions[offsets[i]..offsets[i + 1]]`, ascending. `offsets` has one more entry than `docs`.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockPositions<'a> {
+    pub docs: &'a [u32],
+    pub offsets: &'a [usize],
+    pub positions: &'a [u32],
+}
+
+impl<'a> BlockPositions<'a> {
+    /// The positions of `docs[i]`.
+    #[inline]
+    pub fn of(&self, i: usize) -> &'a [u32] {
+        &self.positions[self.offsets[i]..self.offsets[i + 1]]
+    }
+}
+
 /// Walks the documents of one token's posting list in ascending doc-id order. Doc ids are local
 /// to the partition the list came from.
 ///
@@ -123,6 +141,18 @@ impl PostingCursor {
         }
     }
 
+    /// The decoded doc ids of the current block from the current document on, ascending; empty
+    /// once the cursor is exhausted. It borrows the cursor's own buffer (no copy), so a caller can
+    /// intersect a window of ids with a whole block, then [`PostingCursor::seek`] past its last id.
+    #[inline]
+    pub fn current_block(&self) -> &[u32] {
+        if self.block >= self.num_blocks {
+            &[]
+        } else {
+            &self.doc_ids[self.pos..]
+        }
+    }
+
     /// Moves to the next document and returns it, or [`TERMINATED`].
     pub fn advance(&mut self) -> u32 {
         if self.block >= self.num_blocks {
@@ -180,14 +210,52 @@ impl PostingCursor {
     /// The current document's token positions, ascending, into `out` (cleared first).
     pub fn positions(&mut self, out: &mut Vec<u32>) -> Result<()> {
         out.clear();
+        out.extend_from_slice(self.current_positions()?);
+        Ok(())
+    }
+
+    /// The current document's token positions, ascending, borrowed from the decoded position block
+    /// instead of copied (the block is decoded once, on the first call for it). Valid until the
+    /// cursor moves; empty once it is exhausted.
+    pub fn current_positions(&mut self) -> Result<&[u32]> {
         if !self.with_positions {
             return Err(Error::index(
                 "positions() on a cursor opened without positions".to_string(),
             ));
         }
         if self.block >= self.num_blocks {
-            return Ok(());
+            return Ok(&[]);
         }
+        self.ensure_positions()?;
+        Ok(&self.positions[self.position_offsets[self.pos]..self.position_offsets[self.pos + 1]])
+    }
+
+    /// The current block from the current document on, with every one of its documents'
+    /// positions (P17): the block's position stream is decoded once, as for
+    /// [`PostingCursor::current_positions`], and lent whole, so a caller that intersects a window
+    /// of ids with [`PostingCursor::current_block`] reads each matched document's positions
+    /// without moving the cursor to it. Valid until the cursor moves; empty once it is exhausted.
+    pub fn current_block_positions(&mut self) -> Result<BlockPositions<'_>> {
+        if !self.with_positions {
+            return Err(Error::index(
+                "current_block_positions() on a cursor opened without positions".to_string(),
+            ));
+        }
+        if self.block >= self.num_blocks {
+            return Ok(BlockPositions { docs: &[], offsets: &[0], positions: &[] });
+        }
+        self.ensure_positions()?;
+        Ok(BlockPositions {
+            docs: &self.doc_ids[self.pos..],
+            offsets: &self.position_offsets[self.pos..],
+            positions: &self.positions,
+        })
+    }
+
+    /// Decodes the current block's positions (once per block) into `positions`, with
+    /// `position_offsets[i]..position_offsets[i + 1]` the `i`th document's. The cursor must be
+    /// opened with positions and not exhausted.
+    fn ensure_positions(&mut self) -> Result<()> {
         self.ensure_freqs();
         if self.positions_block != Some(self.block) {
             let Some(CompressedPositionStorage::SharedStream(stream)) = &self.list.positions else {
@@ -217,7 +285,6 @@ impl PostingCursor {
             }
             self.positions_block = Some(self.block);
         }
-        out.extend_from_slice(&self.positions[self.position_offsets[self.pos]..self.position_offsets[self.pos + 1]]);
         Ok(())
     }
 

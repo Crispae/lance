@@ -298,6 +298,150 @@ async fn test_cursor_seek_agrees_with_a_model() {
 }
 
 #[tokio::test]
+async fn test_current_block_walks_the_list_a_block_at_a_time() {
+    const NUM_DOCS: usize = 1_000;
+    let name = "rustie-test/slots-current-block";
+    let index = build_index(name, NUM_DOCS, true).await;
+    let metrics = NoOpMetricsCollector;
+    let partition = &index.partitions()[0];
+
+    for term in ["common", "m3", "third", "eleven"] {
+        let token_id = partition.token_id(term).unwrap();
+        let mut all = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+        let docs: Vec<u32> = drain(&mut all, false).into_iter().map(|(doc, ..)| doc).collect();
+
+        // Taking each block whole and seeking one past its last id visits every id once, in order,
+        // across full blocks and the remainder block.
+        let mut cursor = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+        let mut walked = Vec::new();
+        let mut blocks = 0u64;
+        loop {
+            let block = cursor.current_block();
+            let Some(&last) = block.last() else { break };
+            assert_eq!(block[0], cursor.doc(), "the block starts at the cursor's document");
+            assert!(block.windows(2).all(|w| w[0] < w[1]), "a block ascends");
+            walked.extend_from_slice(block);
+            blocks += 1;
+            // `last + 1` is above the block, so the seek leaves it; that is also true when the
+            // seek's target is the block's final id plus one and nothing follows.
+            assert!(cursor.seek(last + 1) > last);
+        }
+        assert_eq!(walked, docs, "{term}: blocks concatenate to the list");
+        assert_eq!(cursor.doc(), TERMINATED);
+        assert!(cursor.current_block().is_empty(), "an exhausted cursor has no block");
+        assert_eq!(blocks, cursor.work().doc_blocks, "{term}: one decode per block");
+
+        // Mid-block: the slice starts at the current document and ends where the block does, and
+        // advancing one document at a time agrees with it.
+        let mut cursor = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+        let mut at = 0;
+        while cursor.doc() != TERMINATED {
+            let block = cursor.current_block();
+            assert_eq!(block, &docs[at..at + block.len()], "{term}: slice at doc {at}");
+            at += 1;
+            cursor.advance();
+        }
+
+        // A seek that lands on a block's last id leaves a one-id slice, and `last + 1` is above it.
+        for &probe in docs.iter().step_by(37) {
+            let mut cursor = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+            assert_eq!(cursor.seek(probe), probe);
+            let last = *cursor.current_block().last().unwrap();
+            assert!(last >= probe);
+            assert_eq!(cursor.seek(last), last, "seeking the block's last id stays put");
+            assert_eq!(cursor.current_block(), &[last][..]);
+        }
+    }
+    assert!(unregister_tokenizer(name));
+}
+
+#[tokio::test]
+async fn test_current_positions_borrows_what_positions_copies() {
+    const NUM_DOCS: usize = 1_000;
+    let name = "rustie-test/slots-current-positions";
+    let index = build_index(name, NUM_DOCS, true).await;
+    let metrics = NoOpMetricsCollector;
+    let partition = &index.partitions()[0];
+
+    for term in ["common", "m3", "third", "eleven"] {
+        let token_id = partition.token_id(term).unwrap();
+        let (mut borrowing, mut copying) = (
+            partition.posting_cursor(token_id, true, &metrics).await.unwrap(),
+            partition.posting_cursor(token_id, true, &metrics).await.unwrap(),
+        );
+        let mut copied = Vec::new();
+        while copying.doc() != TERMINATED {
+            assert_eq!(borrowing.doc(), copying.doc());
+            copying.positions(&mut copied).unwrap();
+            assert_eq!(borrowing.current_positions().unwrap(), &copied[..], "{term}: doc {}", copying.doc());
+            // Asking twice in one document decodes nothing more.
+            let decoded = borrowing.work().position_blocks;
+            assert_eq!(borrowing.current_positions().unwrap(), &copied[..]);
+            assert_eq!(borrowing.work().position_blocks, decoded);
+            borrowing.advance();
+            copying.advance();
+        }
+        assert_eq!(borrowing.current_positions().unwrap(), &[] as &[u32], "an exhausted cursor has no positions");
+        assert_eq!(borrowing.work().position_blocks, copying.work().position_blocks, "{term}: one decode per block either way");
+    }
+    // A cursor opened without positions refuses, as `positions` does.
+    let token_id = partition.token_id("common").unwrap();
+    let mut no_positions = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+    assert!(no_positions.current_positions().is_err());
+    assert!(unregister_tokenizer(name));
+}
+
+#[tokio::test]
+async fn test_current_block_positions_lends_each_documents_positions() {
+    const NUM_DOCS: usize = 1_000;
+    let name = "rustie-test/slots-block-positions";
+    let index = build_index(name, NUM_DOCS, true).await;
+    let metrics = NoOpMetricsCollector;
+    let partition = &index.partitions()[0];
+
+    for term in ["common", "m3", "third", "eleven"] {
+        let token_id = partition.token_id(term).unwrap();
+        let mut reference = partition.posting_cursor(token_id, true, &metrics).await.unwrap();
+        let expected = drain(&mut reference, true);
+
+        // Block by block: every document's lent positions equal what `positions` copies, and the
+        // walk decodes each position block once, as the per-document walk does.
+        let mut cursor = partition.posting_cursor(token_id, true, &metrics).await.unwrap();
+        let mut walked = Vec::new();
+        loop {
+            let block = cursor.current_block_positions().unwrap();
+            let Some(&last) = block.docs.last() else { break };
+            assert_eq!(block.offsets.len(), block.docs.len() + 1);
+            for (i, &doc) in block.docs.iter().enumerate() {
+                walked.push((doc, block.of(i).to_vec()));
+            }
+            cursor.seek(last + 1);
+        }
+        let expected_docs: Vec<(u32, Vec<u32>)> = expected.iter().map(|(doc, _, p)| (*doc, p.clone())).collect();
+        assert_eq!(walked, expected_docs, "{term}: block positions concatenate to the list's");
+        assert_eq!(cursor.work().position_blocks, reference.work().position_blocks, "{term}: one decode per block");
+        assert_eq!(cursor.current_block_positions().unwrap().docs, &[] as &[u32], "an exhausted cursor lends nothing");
+
+        // Mid-block: the lent block starts at the current document, aligned with `current_block`.
+        let mut cursor = partition.posting_cursor(token_id, true, &metrics).await.unwrap();
+        let mut at = 0;
+        while cursor.doc() != TERMINATED {
+            let block = cursor.current_block_positions().unwrap();
+            assert_eq!(block.docs[0], expected_docs[at].0);
+            assert_eq!(block.of(0), &expected_docs[at].1[..], "{term}: doc {}", block.docs[0]);
+            let tail = block.docs.len() - 1;
+            assert_eq!(block.of(tail), &expected_docs[at + tail].1[..]);
+            at += 1;
+            cursor.advance();
+        }
+    }
+    let token_id = partition.token_id("common").unwrap();
+    let mut no_positions = partition.posting_cursor(token_id, false, &metrics).await.unwrap();
+    assert!(no_positions.current_block_positions().is_err());
+    assert!(unregister_tokenizer(name));
+}
+
+#[tokio::test]
 async fn test_cursor_counts_the_blocks_it_decodes() {
     const NUM_DOCS: usize = 1_000;
     let name = "rustie-test/slots-work";
