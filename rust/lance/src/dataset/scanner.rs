@@ -1124,6 +1124,10 @@ pub struct Scanner {
     /// mask size.
     external_row_mask: Option<Arc<RowAddrMask>>,
 
+    /// Optional plan whose `_rowid` column names the only rows a vector search may return
+    /// (see [`Scanner::with_prefilter_plan`]).
+    prefilter_plan: Option<Arc<dyn ExecutionPlan>>,
+
     /// Materialization style controls when columns are fetched
     materialization_style: MaterializationStyle,
 
@@ -1436,6 +1440,7 @@ impl Scanner {
             blob_handling: BlobHandling::default(),
             prefilter: false,
             external_row_mask: None,
+            prefilter_plan: None,
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
@@ -1663,6 +1668,70 @@ impl Scanner {
     pub fn with_row_addr_prefilter(&mut self, mask: RowAddrMask) -> &mut Self {
         self.external_row_mask = Some(Arc::new(mask));
         self
+    }
+
+    /// Restrict a vector search to the rows a plan produces, as part of the same plan.
+    ///
+    /// `plan` is any [`ExecutionPlan`] with a `_rowid` column (a `UInt64` in the dataset's `_rowid`
+    /// space, as [`Scanner::with_row_addr_prefilter`] takes); only those rows can be returned. It
+    /// is the row source of the search: the way a full-text query is for a full-text-prefiltered
+    /// vector search, so it is a child of the vector plan and shows in `explain_plan` and
+    /// `analyze_plan`. It is executed once. A plan of several partitions is coalesced.
+    ///
+    /// * With a vector index that covers every fragment, the index search takes the plan as its
+    ///   prefilter (`PreFilterSource::FilteredRowIds`). The prefilter is drained before the search
+    ///   starts, as it is for a SQL filter.
+    /// * Without an index (or with `use_index(false)`), the rows' vectors are taken and searched
+    ///   exactly, and nothing else is read.
+    /// * With an index that does not cover every fragment (rows appended since it was built), or
+    ///   whose rows a data overlay made stale, the plan cannot be applied to the fragments the
+    ///   index misses without searching its rows twice, so the query fails and says so: optimize
+    ///   the index, or use `use_index(false)`.
+    ///
+    /// The plan must produce live rows only. It cannot be combined with a SQL filter, a full-text
+    /// or MinHash query, a batch of query vectors, a multivector column, or
+    /// [`Scanner::with_row_addr_prefilter`]; those fail when the plan is created.
+    pub fn with_prefilter_plan(&mut self, plan: Arc<dyn ExecutionPlan>) -> &mut Self {
+        self.prefilter_plan = Some(plan);
+        self
+    }
+
+    /// The plan that feeds the vector search, in one partition (the nodes that consume a
+    /// prefilter run one input partition at a time).
+    fn prefilter_plan_single_partition(&self) -> Option<Arc<dyn ExecutionPlan>> {
+        self.prefilter_plan.as_ref().map(|plan| {
+            if plan.properties().output_partitioning().partition_count() > 1 {
+                Arc::new(CoalescePartitionsExec::new(plan.clone())) as Arc<dyn ExecutionPlan>
+            } else {
+                plan.clone()
+            }
+        })
+    }
+
+    fn validate_prefilter_plan(&self) -> Result<()> {
+        let unsupported = |what: &str| {
+            Err(Error::invalid_input(format!(
+                "with_prefilter_plan cannot be combined with {what}"
+            )))
+        };
+        if self.nearest.is_none() {
+            return Err(Error::invalid_input(
+                "with_prefilter_plan restricts a vector search: call nearest() as well".to_string(),
+            ));
+        }
+        if self.is_batch_nearest {
+            return unsupported("a batch of query vectors");
+        }
+        if self.external_row_mask.is_some() {
+            return unsupported("with_row_addr_prefilter");
+        }
+        if self.full_text_query.is_some() || self.minhash_query.is_some() {
+            return unsupported("a full-text or MinHash query");
+        }
+        if !self.filter.is_none() {
+            return unsupported("a filter");
+        }
+        Ok(())
     }
 
     /// Set the callback to be called after the scan with summary statistics
@@ -3019,6 +3088,10 @@ impl Scanner {
             return Err(Error::not_supported(
                 "with_index_segments is only supported for vector search".to_string(),
             ));
+        }
+
+        if self.prefilter_plan.is_some() {
+            self.validate_prefilter_plan()?;
         }
 
         Ok(())
@@ -6105,6 +6178,11 @@ impl Scanner {
 
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
+        if self.prefilter_plan.is_some() && !matches!(vector_type, DataType::FixedSizeList(_, _)) {
+            return Err(Error::invalid_input(
+                "with_prefilter_plan cannot be combined with a multivector column".to_string(),
+            ));
+        }
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
         let use_index = q.use_index;
@@ -6359,6 +6437,16 @@ impl Scanner {
                 .unwrap_or_else(|| default_distance_type_for(&element_type));
             q.metric_type = Some(metric);
             validate_distance_type_for(metric, &element_type)?;
+            // A plan names the rows: take their vectors and search exactly those, as the
+            // full-text-prefiltered branch does (`vector_search_source`); nothing else is read.
+            if let Some(plan) = self.prefilter_plan_single_partition() {
+                let projection = self
+                    .dataset
+                    .empty_projection()
+                    .union_column(&q.column, OnMissing::Error)?;
+                let taken = self.take(plan, projection)?;
+                return self.flat_knn(taken, &q);
+            }
             // No index found. use flat search.
             let mut columns = vec![q.column.clone()];
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
@@ -6661,6 +6749,13 @@ impl Scanner {
 
         if !has_fallback && !has_stale {
             return Ok(knn_node);
+        }
+        if self.prefilter_plan.is_some() {
+            return Err(Error::invalid_input(format!(
+                "with_prefilter_plan needs a vector index that covers every fragment ({} not covered, {} fragments with rows a data overlay made stale): optimize the index, or use use_index(false)",
+                fallback_fragments.len(),
+                stale_rows.len()
+            )));
         }
 
         let q = q.clone();
@@ -7695,7 +7790,10 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
+        let prefilter_source = match self.prefilter_plan_single_partition() {
+            Some(plan) => PreFilterSource::FilteredRowIds(plan),
+            None => self.ann_prefilter_source(filter_plan, index).await?,
+        };
         let inner_fanout_search = new_knn_exec(
             self.dataset.clone(),
             index,
@@ -9085,6 +9183,270 @@ mod test {
                 "returned _rowid {id} not in allowlist"
             );
         }
+    }
+
+    // ---- with_prefilter_plan (P18): the rows of a plan as the row source of a vector search ----
+
+    /// A plan that produces the given `_rowid`s and fails if it is executed twice (`OneShotExec`).
+    fn rows_plan(ids: &[u64]) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::UInt64Array::from(ids.to_vec()))],
+        )
+        .unwrap();
+        let stream = futures::stream::once(async move { Ok(batch) });
+        Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema, stream,
+        ))))
+    }
+
+    /// The same rows spread over two partitions, to exercise the coalesce.
+    fn rows_plan_in_two_partitions(ids: &[u64]) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]));
+        let (a, b) = ids.split_at(ids.len() / 2);
+        let batch = |rows: &[u64]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::UInt64Array::from(rows.to_vec()))],
+            )
+            .unwrap()
+        };
+        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch(a)], vec![batch(b)]],
+            schema.clone(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn nearest_pairs(batch: &RecordBatch) -> Vec<(u64, f32)> {
+        let distances = batch
+            .column_by_name(DIST_COL)
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        batch_row_ids(batch)
+            .into_iter()
+            .zip(distances.values().iter().copied())
+            .collect()
+    }
+
+    fn assert_same_nearest(got: &[(u64, f32)], want: &[(u64, f32)], what: &str) {
+        let ids = |v: &[(u64, f32)]| v.iter().map(|p| p.0).collect::<Vec<_>>();
+        assert_eq!(ids(got), ids(want), "{what}: rows");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g.1 - w.1).abs() < 1e-5, "{what}: distance {} vs {}", g.1, w.1);
+        }
+    }
+
+    async fn nearest_with_mask(
+        ds: &Dataset,
+        k: usize,
+        use_index: bool,
+        allow: &[u64],
+    ) -> Vec<(u64, f32)> {
+        let key: Float32Array = (0..32).map(|v| v as f32).collect();
+        let mut scan = ds.scan();
+        scan.nearest("vec", &key, k).unwrap();
+        scan.use_index(use_index);
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        nearest_pairs(&scan.try_into_batch().await.unwrap())
+    }
+
+    async fn nearest_with_plan(
+        ds: &Dataset,
+        k: usize,
+        use_index: bool,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Vec<(u64, f32)>> {
+        let key: Float32Array = (0..32).map(|v| v as f32).collect();
+        let mut scan = ds.scan();
+        scan.nearest("vec", &key, k).unwrap();
+        scan.use_index(use_index);
+        scan.with_prefilter_plan(plan);
+        scan.with_row_id();
+        Ok(nearest_pairs(&scan.try_into_batch().await?))
+    }
+
+    async fn all_row_ids(ds: &Dataset) -> Vec<u64> {
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        batch_row_ids(&scan.try_into_batch().await.unwrap())
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn prefilter_plan_equals_the_row_addr_prefilter(#[case] stable_row_ids: bool) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let ds = &test_ds.dataset;
+        let all = all_row_ids(ds).await;
+
+        let allowed: Vec<(&str, Vec<u64>)> = vec![
+            ("every third row", all.iter().copied().step_by(3).collect()),
+            ("all rows", all.clone()),
+            ("one row", vec![all[7]]),
+            ("no rows", Vec::new()),
+        ];
+        for (name, allow) in &allowed {
+            for use_index in [true, false] {
+                let what = format!("{name}, use_index {use_index}, stable {stable_row_ids}");
+                let want = nearest_with_mask(ds, 15, use_index, allow).await;
+                let got = nearest_with_plan(ds, 15, use_index, rows_plan(allow))
+                    .await
+                    .unwrap();
+                assert_same_nearest(&got, &want, &what);
+                assert_eq!(got.is_empty(), allow.is_empty(), "{what}");
+                let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+                assert!(got.iter().all(|(id, _)| allow_set.contains(id)), "{what}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn prefilter_plan_without_an_index_takes_only_its_rows(#[case] stable_row_ids: bool) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+        let all = all_row_ids(ds).await;
+        let allow: Vec<u64> = all.iter().copied().step_by(4).collect();
+        let want = nearest_with_mask(ds, 10, true, &allow).await;
+        let got = nearest_with_plan(ds, 10, true, rows_plan(&allow))
+            .await
+            .unwrap();
+        assert!(!got.is_empty());
+        assert_same_nearest(&got, &want, "flat, no index");
+    }
+
+    #[tokio::test]
+    async fn prefilter_plan_coalesces_a_plan_of_several_partitions() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let all = all_row_ids(&test_ds.dataset).await;
+        let allow: Vec<u64> = all.iter().copied().step_by(3).collect();
+        let flat = nearest_with_mask(&test_ds.dataset, 12, true, &allow).await;
+        let got = nearest_with_plan(&test_ds.dataset, 12, true, rows_plan_in_two_partitions(&allow))
+            .await
+            .unwrap();
+        assert_same_nearest(&got, &flat, "flat, two partitions");
+
+        test_ds.make_vector_index().await.unwrap();
+        let ds = &test_ds.dataset;
+        let want = nearest_with_mask(ds, 12, true, &allow).await;
+        let got = nearest_with_plan(ds, 12, true, rows_plan_in_two_partitions(&allow))
+            .await
+            .unwrap();
+        assert_same_nearest(&got, &want, "indexed, two partitions");
+    }
+
+    #[tokio::test]
+    async fn prefilter_plan_is_a_child_of_the_vector_plan_and_runs_once() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let all = all_row_ids(&test_ds.dataset).await;
+        let allow: Vec<u64> = all.iter().copied().step_by(2).collect();
+        for indexed in [false, true] {
+            if indexed {
+                test_ds.make_vector_index().await.unwrap();
+            }
+            let ds = &test_ds.dataset;
+            let key: Float32Array = (0..32).map(|v| v as f32).collect();
+            let mut scan = ds.scan();
+            scan.nearest("vec", &key, 10).unwrap();
+            scan.with_prefilter_plan(rows_plan(&allow));
+            scan.with_row_id();
+            let text = scan.explain_plan(true).await.unwrap();
+            assert!(
+                text.contains("OneShotStream"),
+                "indexed {indexed}: the row source is a node of the plan:\n{text}"
+            );
+            // `OneShotExec` fails on a second execution, so a successful run executed it once.
+            let got = nearest_with_plan(ds, 10, true, rows_plan(&allow))
+                .await
+                .unwrap();
+            assert_eq!(got.len(), 10, "indexed {indexed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefilter_plan_refuses_an_index_that_does_not_cover_every_fragment() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        // Appended after the index was built: that fragment is not covered.
+        test_ds.append_new_data().await.unwrap();
+        let ds = &test_ds.dataset;
+        let all = all_row_ids(ds).await;
+        let allow: Vec<u64> = all.iter().copied().step_by(3).collect();
+
+        let err = nearest_with_plan(ds, 10, true, rows_plan(&allow))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covers every fragment"),
+            "unexpected: {err}"
+        );
+        // Without the index the plan's rows are searched exactly, appended rows included.
+        let want = nearest_with_mask(ds, 10, false, &allow).await;
+        let got = nearest_with_plan(ds, 10, false, rows_plan(&allow))
+            .await
+            .unwrap();
+        assert!(!got.is_empty());
+        assert_same_nearest(&got, &want, "use_index(false) over an uncovered fragment");
+    }
+
+    #[tokio::test]
+    async fn prefilter_plan_is_refused_with_what_it_cannot_be_combined_with() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+        let key: Float32Array = (0..32).map(|v| v as f32).collect();
+        let all = all_row_ids(ds).await;
+
+        let mut scan = ds.scan();
+        scan.with_prefilter_plan(rows_plan(&all));
+        let err = scan.try_into_batch().await.unwrap_err();
+        assert!(err.to_string().contains("nearest"), "unexpected: {err}");
+
+        let mut scan = ds.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.filter("i >= 5").unwrap();
+        scan.with_prefilter_plan(rows_plan(&all));
+        let err = scan.try_into_batch().await.unwrap_err();
+        assert!(err.to_string().contains("filter"), "unexpected: {err}");
+
+        let mut scan = ds.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::allow_nothing());
+        scan.with_prefilter_plan(rows_plan(&all));
+        let err = scan.try_into_batch().await.unwrap_err();
+        assert!(
+            err.to_string().contains("with_row_addr_prefilter"),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]
