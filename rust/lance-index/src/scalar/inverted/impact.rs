@@ -233,6 +233,34 @@ impl ImpactSkipData {
         &self.0.entries
     }
 
+    /// The largest `f(freq, doc_len)` over the frontier pairs of the level-0 entry of `block_idx` (P19): a bound for every document of
+    /// the block when `f` rises with the frequency and falls with the length, because the frontier holds, for each frequency, the
+    /// shortest document and the lengths are bucket floors (see `dequantize_doc_length`). `None` when the block is past the list or its
+    /// entry is missing or malformed, so a caller never skips on a bound it cannot trust.
+    pub fn level0_max(&self, block_idx: usize, f: &mut dyn FnMut(u32, u32) -> f32) -> Option<f32> {
+        if block_idx >= self.0.level0_len {
+            return None;
+        }
+        self.entry_max(block_idx, f)
+    }
+
+    /// [`Self::level0_max`] over the level-1 group of 32 blocks.
+    pub fn level1_max(&self, group_idx: usize, f: &mut dyn FnMut(u32, u32) -> f32) -> Option<f32> {
+        if group_idx >= level1_len(self.0.level0_len) {
+            return None;
+        }
+        self.entry_max(self.0.level0_len + group_idx, f)
+    }
+
+    fn entry_max(&self, entry_idx: usize, f: &mut dyn FnMut(u32, u32) -> f32) -> Option<f32> {
+        if self.0.entries.is_null(entry_idx) {
+            return None;
+        }
+        let mut max = f32::NEG_INFINITY;
+        for_each_entry_pair(self.0.entries.value(entry_idx), |freq, doc_len| max = max.max(f(freq, doc_len))).ok()?;
+        Some(max)
+    }
+
     /// Conservative heap charge for the shared allocation, its query-independent
     /// derived state, and one shared keyed-bound slab, whether or not that slab
     /// has been initialized yet. The Arrow impact entries' buffers are owned by

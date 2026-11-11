@@ -139,6 +139,42 @@ impl CacheKey for TermListKey {
     }
 }
 
+/// A token's impact skip data as read by the bulk path (just the `_impacts` rows): `None` when the list has none or they do not parse.
+#[derive(Debug, Clone)]
+pub struct TermImpacts(pub(super) Option<ImpactSkipData>);
+
+impl DeepSizeOf for TermImpacts {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        // The entries' buffers plus the state derived from them, as the packed-group cache charges an `ImpactSkipData`.
+        self.0.as_ref().map_or(0, |impacts| impacts.derived_cache_bytes() + impacts.entries().get_array_memory_size())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TermImpactsKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for TermImpactsKey {
+    type ValueType = TermImpacts;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("term-impacts-{}", self.token_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "TermImpacts"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.term-impacts-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.token_id);
+    }
+}
+
 /// A token's number of documents as read by the bulk path (just the `_length` column).
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct TermLength(pub(super) u32);
@@ -330,6 +366,46 @@ impl PostingListReader {
             found.insert(token, list);
         }
         Ok(())
+    }
+
+    /// The impact skip data of `token_ids` (any order, repeats allowed), in that order, for the lists `lists` of the same tokens (their block
+    /// counts say how many entries each has) (P19). Read like [`Self::bulk_term_lists`]: only the `_impacts` rows asked for, nearby ones in one
+    /// request, cached per token. An index built without impacts, or an entry that does not parse, gives `None`, and the list is read as before.
+    pub(super) async fn bulk_term_impacts(&self, token_ids: &[u32], lists: &[CompressedPostingList]) -> Result<Vec<Option<ImpactSkipData>>> {
+        self.ensure_bulk_layout()?;
+        if !self.has_impacts {
+            return Ok(vec![None; token_ids.len()]);
+        }
+        let mut found: HashMap<u32, Option<ImpactSkipData>> = HashMap::new();
+        let mut missing: Vec<u32> = Vec::new();
+        for &token in token_ids {
+            if found.contains_key(&token) || missing.contains(&token) {
+                continue;
+            }
+            match self.index_cache.get_with_key(&TermImpactsKey { token_id: token }).await {
+                Some(hit) => {
+                    found.insert(token, hit.0.clone());
+                }
+                None => missing.push(token),
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            let lengths = self.bulk_lengths(&missing).await?;
+            // An impact row is a few bytes per 128 documents, far smaller than the posting row.
+            let ranges = coalesce_rows(&missing, |row| 16 + u64::from(lengths.get(&row).copied().unwrap_or(0)) / 16);
+            let batches = self.read_row_ranges(&ranges, &[IMPACT_COL]).await?;
+            let blocks_of: HashMap<u32, usize> = token_ids.iter().copied().zip(lists.iter().map(|list| list.blocks.len())).collect();
+            for &token in &missing {
+                let at = ranges.partition_point(|range| range.end <= token);
+                let row = (token - ranges[at].start) as usize;
+                let entries = batches[at][IMPACT_COL].as_list::<i32>().value(row).as_binary::<i64>().clone();
+                let impacts = ImpactSkipData::new(entries, blocks_of[&token]).ok();
+                self.index_cache.insert_with_key(&TermImpactsKey { token_id: token }, Arc::new(TermImpacts(impacts.clone()))).await;
+                found.insert(token, impacts);
+            }
+        }
+        Ok(token_ids.iter().map(|token| found[token].clone()).collect())
     }
 
     /// The positions of `token_ids` (any order, repeats allowed), in that order, read like

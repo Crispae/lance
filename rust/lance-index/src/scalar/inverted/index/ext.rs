@@ -129,7 +129,36 @@ impl InvertedPartition {
         with_positions: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<PostingCursor>> {
+        self.posting_cursors_impl(token_ids, with_positions, false, metrics).await
+    }
+
+    /// [`Self::posting_cursors`] whose cursors also carry each list's impact skip data (P19), so
+    /// [`PostingCursor::block_bound_at`] and [`PostingCursor::group_bound_at`] can bound a block before it is decoded. The `_impacts`
+    /// rows of the requested tokens are read as well (a few bytes per 128 documents); an index without impacts gives cursors that answer
+    /// `None` and behave exactly as those of [`Self::posting_cursors`].
+    pub async fn posting_cursors_with_impacts(
+        &self,
+        token_ids: &[u32],
+        with_positions: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<PostingCursor>> {
+        self.posting_cursors_impl(token_ids, with_positions, true, metrics).await
+    }
+
+    async fn posting_cursors_impl(
+        &self,
+        token_ids: &[u32],
+        with_positions: bool,
+        with_impacts: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<PostingCursor>> {
         let mut lists = self.inverted_list.bulk_term_lists(token_ids, metrics).await?;
+        if with_impacts {
+            let impacts = self.inverted_list.bulk_term_impacts(token_ids, &lists).await?;
+            for (list, impacts) in lists.iter_mut().zip(impacts) {
+                list.impacts = impacts;
+            }
+        }
         if with_positions {
             let positions = self.inverted_list.bulk_positions(token_ids, metrics).await?;
             for (list, positions) in lists.iter_mut().zip(positions) {

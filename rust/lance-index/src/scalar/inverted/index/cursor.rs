@@ -153,6 +153,65 @@ impl PostingCursor {
         }
     }
 
+    /// Whether the list carries impact skip data (it was opened with [`InvertedPartition::posting_cursors_with_impacts`] on an index that
+    /// has them), so the block bounds below answer.
+    pub fn has_impacts(&self) -> bool {
+        self.list.impacts.is_some()
+    }
+
+    /// The blocks of the list (the last may be shorter).
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
+    /// Documents in a full block of this list (128 for an index built with the default block size).
+    pub fn block_size(&self) -> usize {
+        self.list.block_size
+    }
+
+    /// The block the cursor is in; [`Self::num_blocks`] once it is exhausted.
+    pub fn block_index(&self) -> usize {
+        self.block
+    }
+
+    /// The blocks one level-1 group covers (see [`Self::group_bound_at`]).
+    pub const BLOCKS_PER_GROUP: usize = super::super::impact::IMPACT_LEVEL1_BLOCKS;
+
+    /// The largest `f(freq, doc_len)` over the impact pairs of `block` (P19): at least `f` of every document of the block when `f` rises
+    /// with the frequency and falls with the length (the lengths are bucket floors). Reads no block: a caller asks about a block before
+    /// it decodes it. `None` without impacts, past the list, or for an entry that does not parse; never skip on `None`.
+    pub fn block_bound_at(&self, block: usize, f: &mut dyn FnMut(u32, u32) -> f32) -> Option<f32> {
+        if block >= self.num_blocks {
+            return None;
+        }
+        self.list.impacts.as_ref()?.level0_max(block, f)
+    }
+
+    /// [`Self::block_bound_at`] for the group of [`Self::BLOCKS_PER_GROUP`] blocks `group * 32 ..`: a bound for all of their documents.
+    pub fn group_bound_at(&self, group: usize, f: &mut dyn FnMut(u32, u32) -> f32) -> Option<f32> {
+        self.list.impacts.as_ref()?.level1_max(group, f)
+    }
+
+    /// The last document id of `block`, from the impact entry ([`TERMINATED`] without impacts or past the list).
+    pub fn block_last_doc_at(&self, block: usize) -> u32 {
+        if block >= self.num_blocks {
+            return TERMINATED;
+        }
+        self.list.impacts.as_ref().and_then(|impacts| impacts.level0_doc_up_to(block)).unwrap_or(TERMINATED)
+    }
+
+    /// Moves to the first document of `block`, decoding only that block, or stays where it is when `block` is not after the cursor's
+    /// (a cursor never moves backwards); [`TERMINATED`] once `block` is past the last. The skip of P19: a caller that found a block, or a
+    /// run of blocks, below its threshold continues at the next block without decoding what it passed.
+    pub fn seek_block(&mut self, block: usize) -> u32 {
+        if self.block >= self.num_blocks || block <= self.block {
+            return self.doc();
+        }
+        self.work.seeks += 1;
+        self.load_block(block);
+        self.doc()
+    }
+
     /// Moves to the next document and returns it, or [`TERMINATED`].
     pub fn advance(&mut self) -> u32 {
         if self.block >= self.num_blocks {

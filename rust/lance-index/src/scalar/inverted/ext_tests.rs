@@ -1070,3 +1070,63 @@ async fn test_parallel_workers_leave_partitions_in_row_order() {
     assert_eq!(found, expected, "the postings of every term");
     assert!(unregister_tokenizer(name));
 }
+
+/// P19: the bound of a block, and of a group of 32 blocks, read before anything is decoded, covers every document in it, for a score that
+/// rises with the frequency and falls with the length; a block ends where its entry says; `seek_block` decodes only the block it lands on;
+/// and a list opened without impacts answers `None` and is otherwise the cursor it was.
+#[tokio::test]
+async fn test_block_bounds_cover_every_document_of_their_block() {
+    const NUM_DOCS: usize = 5_000;
+    let name = "rustie-test/slots-block-bounds";
+    let index = build_index(name, NUM_DOCS, false).await;
+    let metrics = NoOpMetricsCollector;
+    let (mut checked_blocks, mut saw_two_groups) = (0usize, false);
+    for partition in index.partitions() {
+        let rows = partition.rows().await.unwrap();
+        // BM25-shaped: rises with the frequency, falls with the length.
+        let score = |freq: u32, len: u32| freq as f32 / (freq as f32 + 1.2 * (0.25 + 0.75 * len as f32 / 9.0));
+        for term in ["common", "m3", "third", "z7", "y3"] {
+            let Some(token) = partition.token_id(term) else { continue };
+            let mut plain = partition.posting_cursors(&[token], false, &metrics).await.unwrap().remove(0);
+            assert!(!plain.has_impacts(), "{term}: a cursor opened without impacts has none");
+            assert_eq!(plain.block_bound_at(0, &mut |f, l| score(f, l)), None);
+            assert_eq!(plain.group_bound_at(0, &mut |f, l| score(f, l)), None);
+            assert_eq!(plain.block_last_doc_at(0), TERMINATED);
+
+            let mut cursor = partition.posting_cursors_with_impacts(&[token], false, &metrics).await.unwrap().remove(0);
+            assert!(cursor.has_impacts(), "{term}");
+            let docs: Vec<(u32, u32)> = drain(&mut plain, false).into_iter().map(|(doc, freq, _)| (doc, freq)).collect();
+            let (blocks, size) = (cursor.num_blocks(), cursor.block_size());
+            assert_eq!(blocks, docs.len().div_ceil(size));
+            saw_two_groups |= blocks > PostingCursor::BLOCKS_PER_GROUP;
+            let true_score = |range: std::ops::Range<usize>| docs[range].iter().map(|&(doc, freq)| score(freq, rows.doc_length(doc))).fold(0.0f32, f32::max);
+            for block in 0..blocks {
+                let range = block * size..((block + 1) * size).min(docs.len());
+                let bound = cursor.block_bound_at(block, &mut |f, l| score(f, l)).expect("impacts");
+                assert!(bound >= true_score(range.clone()), "{term} block {block}: bound {bound} below a document's score {}", true_score(range.clone()));
+                assert_eq!(cursor.block_last_doc_at(block), docs[range.end - 1].0, "{term} block {block}: where it ends");
+                let group = block / PostingCursor::BLOCKS_PER_GROUP;
+                let group_range = group * PostingCursor::BLOCKS_PER_GROUP * size..((group + 1) * PostingCursor::BLOCKS_PER_GROUP * size).min(docs.len());
+                let group_bound = cursor.group_bound_at(group, &mut |f, l| score(f, l)).expect("impacts");
+                assert!(group_bound >= bound && group_bound >= true_score(group_range), "{term} group {group}: bound {group_bound}");
+                checked_blocks += 1;
+            }
+            assert_eq!(cursor.block_bound_at(blocks, &mut |f, l| score(f, l)), None, "past the list");
+            assert_eq!(cursor.block_last_doc_at(blocks), TERMINATED);
+
+            // `seek_block` decodes only the block it lands on, and never moves backwards.
+            if blocks >= 3 {
+                let decoded = cursor.work().doc_blocks;
+                assert_eq!(cursor.seek_block(2), docs[2 * size].0, "{term}");
+                assert_eq!(cursor.work().doc_blocks, decoded + 1, "{term}: one block decoded, none of those passed");
+                assert_eq!(cursor.block_index(), 2);
+                assert_eq!(cursor.seek_block(1), docs[2 * size].0, "{term}: never backwards");
+                assert_eq!(cursor.seek_block(blocks), TERMINATED);
+                assert_eq!(cursor.doc(), TERMINATED);
+            }
+        }
+    }
+    assert!(checked_blocks > 20, "{checked_blocks} blocks checked");
+    assert!(saw_two_groups, "a list long enough for two groups was checked");
+    assert!(unregister_tokenizer(name));
+}
